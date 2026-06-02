@@ -19,7 +19,6 @@ var missingEnv = [];
 });
 if (missingEnv.length) {
   console.error('MISSING ENV VARS:', missingEnv.join(', '));
-  // Don't crash — log clearly so Render dashboard shows the issue
 }
 
 const app = express();
@@ -36,7 +35,7 @@ app.use(express.json({ limit: '1mb' }));
 // ── CORS ──
 app.use(function(req, res, next) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
@@ -77,9 +76,54 @@ app.get('/health', function(req, res) {
   });
 });
 
+// ── GET /proxy — streams Atlas video URL to browser (bypasses CORS) ──
+app.get('/proxy', function(req, res) {
+  var videoUrl = req.query.url;
+  if (!videoUrl || !videoUrl.startsWith('http')) {
+    return res.status(400).json({ error: 'Missing or invalid url parameter' });
+  }
+
+  var redirectCount = 0;
+
+  function doProxy(currentUrl) {
+    var proto2 = currentUrl.startsWith('https') ? https : http;
+    var req2 = proto2.get(currentUrl, function(upstream) {
+      // Handle redirects
+      if ([301,302,307,308].includes(upstream.statusCode) && upstream.headers.location) {
+        if (++redirectCount > 5) return res.status(502).json({ error: 'Too many redirects' });
+        return doProxy(upstream.headers.location);
+      }
+      if (upstream.statusCode !== 200) {
+        return res.status(upstream.statusCode).json({ error: 'Upstream error: ' + upstream.statusCode });
+      }
+      // Stream directly to browser
+      res.setHeader('Content-Type', upstream.headers['content-type'] || 'video/mp4');
+      res.setHeader('Content-Disposition', 'inline; filename="regesai-video.mp4"');
+      res.setHeader('Cache-Control', 'no-cache');
+      if (upstream.headers['content-length']) {
+        res.setHeader('Content-Length', upstream.headers['content-length']);
+      }
+      upstream.pipe(res);
+      upstream.on('error', function(e) {
+        console.error('Proxy stream error:', e.message);
+        if (!res.headersSent) res.status(502).json({ error: e.message });
+      });
+    });
+    req2.on('error', function(e) {
+      console.error('Proxy request error:', e.message);
+      if (!res.headersSent) res.status(502).json({ error: e.message });
+    });
+    req2.setTimeout(60000, function() {
+      req2.destroy();
+      if (!res.headersSent) res.status(504).json({ error: 'Proxy timeout' });
+    });
+  }
+
+  doProxy(videoUrl);
+});
+
 // ── POST /merge ──
 app.post('/merge', function(req, res) {
-  // Guard: req.body could be undefined if middleware failed
   if (!req.body || typeof req.body !== 'object') {
     return res.status(400).json({ error: 'Invalid JSON body' });
   }
@@ -97,17 +141,13 @@ app.post('/merge', function(req, res) {
     job_id = 'merge-' + Date.now();
   }
 
-  // Validate all URLs
   for (var i = 0; i < clips.length; i++) {
     if (!clips[i] || typeof clips[i] !== 'string' || !clips[i].startsWith('http')) {
       return res.status(400).json({ error: 'Invalid URL for clip ' + (i+1) });
     }
   }
 
-  // Return 202 immediately
   res.status(202).json({ job_id: job_id, status: 'pending' });
-
-  // Process async
   processMerge(clips, job_id).catch(function(err) {
     console.error('processMerge unhandled error:', err.message);
   });
@@ -121,7 +161,6 @@ async function processMerge(clips, job_id) {
     fs.mkdirSync(tmpDir, { recursive: true });
     await updateJob(job_id, { status: 'downloading' });
 
-    // Download clips sequentially
     var clipPaths = [];
     for (var i = 0; i < clips.length; i++) {
       var clipPath = path.join(tmpDir, 'clip' + i + '.mp4');
@@ -138,7 +177,6 @@ async function processMerge(clips, job_id) {
 
     await updateJob(job_id, { status: 'merging' });
 
-    // Write concat list
     var listPath   = path.join(tmpDir, 'list.txt');
     var outputPath = path.join(tmpDir, 'merged.mp4');
     fs.writeFileSync(listPath,
@@ -146,7 +184,6 @@ async function processMerge(clips, job_id) {
       'utf8'
     );
 
-    // Run FFmpeg via execFileSync — no shell, safer
     console.log('[' + job_id + '] Running FFmpeg...');
     try {
       execFileSync(ffmpegPath, [
@@ -165,7 +202,6 @@ async function processMerge(clips, job_id) {
       throw new Error('FFmpeg failed: ' + ffMsg);
     }
 
-    // Verify output
     if (!fs.existsSync(outputPath)) throw new Error('FFmpeg produced no output');
     var outStat = fs.statSync(outputPath);
     if (outStat.size < 1000) throw new Error('Merged file too small (' + outStat.size + 'B)');
@@ -173,7 +209,6 @@ async function processMerge(clips, job_id) {
 
     await updateJob(job_id, { status: 'uploading' });
 
-    // Upload to R2 using streams — avoids loading entire file into RAM
     var r2Key = 'merged/' + safeId + '.mp4';
     var fileStream = fs.createReadStream(outputPath);
 
@@ -185,7 +220,6 @@ async function processMerge(clips, job_id) {
       ContentLength:  outStat.size,
     }));
 
-    // Build output URL
     var outputUrl = (process.env.R2_PUBLIC_URL || '').replace(/\/$/, '')
       ? process.env.R2_PUBLIC_URL.replace(/\/$/, '') + '/' + r2Key
       : process.env.R2_ENDPOINT.replace(/\/$/, '') + '/' + BUCKET + '/' + r2Key;
@@ -229,7 +263,6 @@ function downloadFile(url, destPath) {
       }
 
       var req = proto.get(currentUrl, function(res) {
-        // Handle redirects
         if ([301,302,307,308].includes(res.statusCode) && res.headers.location) {
           file.destroy();
           fs.unlink(destPath, function(){});
