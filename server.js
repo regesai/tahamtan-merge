@@ -12,6 +12,7 @@ const fs      = require('fs');
 const path    = require('path');
 const os      = require('os');
 const { createClient } = require('@supabase/supabase-js');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -23,7 +24,24 @@ const supabase = (SUPABASE_URL && SUPABASE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_KEY)
   : null;
 
-// Bucket for merged videos — MUST exist in Supabase Storage and be public-read.
+// ── Cloudflare R2 (primary storage for merged videos) ─────────
+// Zero egress fees — the right home for video. Uses the S3-compatible API
+// with the R2_* variables already set on this Railway service.
+const R2_ACCOUNT_ID        = process.env.R2_ACCOUNT_ID        || '';
+const R2_ACCESS_KEY_ID     = process.env.R2_ACCESS_KEY_ID     || '';
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || '';
+const R2_BUCKET            = process.env.R2_BUCKET            || 'tahamtan-videos';
+const R2_PUBLIC_URL        = (process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
+
+const r2 = (R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY)
+  ? new S3Client({
+      region: 'auto',
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+    })
+  : null;
+
+// Fallback bucket in Supabase Storage — used only if R2 is unavailable.
 const MERGE_BUCKET = process.env.MERGE_BUCKET || 'videos';
 
 app.use(cors());
@@ -95,7 +113,7 @@ app.post('/merge', async (req, res) => {
 
     // 5. Upload to Supabase Storage
     await updateJob(job_id, 'uploading');
-    const publicUrl = await uploadToSupabase(job_id, outputFile);
+    const publicUrl = await storeMergedVideo(job_id, outputFile);
 
     // 6. Done — update job with video URL
     await updateJob(job_id, 'done', publicUrl);
@@ -200,22 +218,39 @@ async function mergeVideosSmooth(files, outputFile) {
   });
 }
 
-async function uploadToSupabase(job_id, filePath) {
-  if (!supabase) {
-    // No Supabase — return local file as base64 data URL (fallback)
-    console.warn('No Supabase configured — cannot upload merged video');
-    throw new Error('Supabase not configured for video storage');
-  }
+// Store the merged video permanently. R2 first (zero egress — free to serve),
+// Supabase Storage as fallback so a merge never dies just because R2 hiccuped.
+async function storeMergedVideo(job_id, filePath) {
   const fileBuffer = fs.readFileSync(filePath);
   const fileName   = `merged/${job_id}-${Date.now()}.mp4`;
 
+  // 1. R2 (primary)
+  if (r2 && R2_PUBLIC_URL) {
+    try {
+      await r2.send(new PutObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: fileName,
+        Body: fileBuffer,
+        ContentType: 'video/mp4',
+      }));
+      const url = `${R2_PUBLIC_URL}/${fileName}`;
+      console.log(`[${job_id}] Stored on R2: ${url}`);
+      return url;
+    } catch (e) {
+      console.error(`[${job_id}] R2 upload failed (falling back to Supabase):`, e.message);
+    }
+  } else {
+    console.warn(`[${job_id}] R2 not configured (need R2_ACCOUNT_ID / keys / R2_PUBLIC_URL) — using Supabase Storage`);
+  }
+
+  // 2. Supabase Storage (fallback)
+  if (!supabase) throw new Error('Neither R2 nor Supabase available for video storage');
   const { error } = await supabase.storage
     .from(MERGE_BUCKET)
     .upload(fileName, fileBuffer, { contentType: 'video/mp4', upsert: true });
-
   if (error) throw new Error('Supabase upload failed: ' + error.message);
-
   const { data } = supabase.storage.from(MERGE_BUCKET).getPublicUrl(fileName);
+  console.log(`[${job_id}] Stored on Supabase (fallback): ${data.publicUrl}`);
   return data.publicUrl;
 }
 
