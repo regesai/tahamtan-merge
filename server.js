@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════
 // TAHAMTAN AI — Video Merge Service
 // Merges multiple AI video clips into one seamless MP4
+// Also persists single generated clips to R2 (permanent URLs)
 // Deploy on Railway.app — always on, no cold starts
 // ═══════════════════════════════════════════════════════════════
 
@@ -53,6 +54,8 @@ app.get('/health', (req, res) => {
 });
 
 // ─── PROXY (CORS-safe playback for generated video URLs) ─────
+// NOTE: this only streams the upstream (temporary) URL — it does NOT persist.
+// Use /save to get a permanent R2 link.
 app.get('/proxy', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'url param required' });
@@ -64,6 +67,35 @@ app.get('/proxy', async (req, res) => {
     r.body.pipe(res);
   } catch (e) {
     res.status(502).json({ error: e.message });
+  }
+});
+
+// ─── SAVE (persist a single generated clip to R2 permanently) ─
+// The frontend calls this the moment a single video is ready, passing the
+// provider's temporary URL (e.g. the volces / Seedance signed URL).
+// Returns a permanent R2 URL that never expires.
+//
+//   POST /save   { "url": "<provider temporary url>", "job_id": "optional" }
+//   → 200        { "status": "ok", "url": "<permanent R2 url>" }
+app.post('/save', async (req, res) => {
+  const { url, job_id } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url required' });
+
+  const id = job_id || `vid-${Date.now()}`;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'save-'));
+  const localPath = path.join(tmpDir, 'video.mp4');
+
+  try {
+    console.log(`[${id}] Save requested — source: ${String(url).slice(0, 90)}...`);
+    await downloadFile(url, localPath);
+    const publicUrl = await storeMergedVideo(id, localPath, 'videos');
+    console.log(`[${id}] Saved to storage: ${publicUrl}`);
+    res.json({ status: 'ok', url: publicUrl });
+  } catch (err) {
+    console.error(`[${id}] Save failed:`, err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
   }
 });
 
@@ -111,7 +143,7 @@ app.post('/merge', async (req, res) => {
       console.log(`[${job_id}] Concat merge complete — ${outputFile}`);
     }
 
-    // 5. Upload to Supabase Storage
+    // 5. Upload to storage (R2 first, Supabase fallback)
     await updateJob(job_id, 'uploading');
     const publicUrl = await storeMergedVideo(job_id, outputFile);
 
@@ -218,11 +250,12 @@ async function mergeVideosSmooth(files, outputFile) {
   });
 }
 
-// Store the merged video permanently. R2 first (zero egress — free to serve),
-// Supabase Storage as fallback so a merge never dies just because R2 hiccuped.
-async function storeMergedVideo(job_id, filePath) {
+// Store a video permanently. R2 first (zero egress — free to serve),
+// Supabase Storage as fallback so a job never dies just because R2 hiccuped.
+// `prefix` controls the folder in the bucket: 'merged' (default) or 'videos'.
+async function storeMergedVideo(job_id, filePath, prefix = 'merged') {
   const fileBuffer = fs.readFileSync(filePath);
-  const fileName   = `merged/${job_id}-${Date.now()}.mp4`;
+  const fileName   = `${prefix}/${job_id}-${Date.now()}.mp4`;
 
   // 1. R2 (primary)
   if (r2 && R2_PUBLIC_URL) {
