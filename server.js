@@ -162,7 +162,7 @@ app.post('/caption', async (req, res) => {
 
     await updateJob(job_id, 'captioning');
     const assPath = path.join(tmpDir, 'sub.ass');
-    fs.writeFileSync(assPath, buildAss(cues, { rtl: !!rtl, style: style || {} }));
+    fs.writeFileSync(assPath, buildAss(cues, { rtl: !!rtl, lang: (req.body && req.body.lang) || '', style: style || {} }));
 
     const outPath = path.join(tmpDir, 'out.mp4');
     await burnSubtitles(inPath, assPath, outPath, tmpDir);
@@ -192,12 +192,24 @@ function assTime(sec) {
   return h + ':' + p2(m) + ':' + p2(s) + '.' + p2(cs);
 }
 
+// Pick the Noto font family that covers a language's script.
+// These families are all provided by fonts-noto-core / fonts-noto-cjk
+// (installed via the Dockerfile), so fontconfig resolves them.
+function fontForLang(lang) {
+  switch (String(lang || '').toLowerCase()) {
+    case 'ar': case 'fa': case 'ur': return 'Noto Sans Arabic';
+    case 'hi':                       return 'Noto Sans Devanagari';
+    case 'zh':                       return 'Noto Sans CJK SC';
+    default:                         return 'Noto Sans'; // Latin + Cyrillic + Greek
+  }
+}
+
 // Build a styled ASS subtitle file from cues. Social look: big bold text,
 // thick outline, bottom-centred. RTL-aware for fa/ar/ur.
 function buildAss(cues, opts) {
   opts = opts || {};
   const st = opts.style || {};
-  const fontName = st.font || 'Vazirmatn';      // ship this font in /fonts (covers fa/ar/ur/latin)
+  const fontName = st.font || fontForLang(opts.lang);
   const fontSize = st.size || 22;
   const primary  = st.primary  || '&H00FFFFFF';  // white   (AABBGGRR)
   const outline  = st.outline  || '&H00000000';  // black
@@ -236,9 +248,15 @@ function buildAss(cues, opts) {
 // fontsdir lets us ship a font that covers Persian/Arabic/Urdu.
 function burnSubtitles(inPath, assPath, outPath, workDir) {
   return new Promise((resolve, reject) => {
+    // Escape the path for ffmpeg's filter graph. Fonts are resolved by
+    // fontconfig from the system Noto fonts installed in the Docker image,
+    // so no fontsdir is needed (optional override via FONTS_DIR).
     const escaped = assPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
-    const fontsDir = (process.env.FONTS_DIR || (__dirname + '/fonts')).replace(/\\/g, '/').replace(/:/g, '\\:');
-    const vf = "ass='" + escaped + "':fontsdir='" + fontsDir + "'";
+    let vf = "ass='" + escaped + "'";
+    if (process.env.FONTS_DIR) {
+      const fontsDir = process.env.FONTS_DIR.replace(/\\/g, '/').replace(/:/g, '\\:');
+      vf = "ass='" + escaped + "':fontsdir='" + fontsDir + "'";
+    }
     ffmpeg()
       .input(inPath)
       .videoFilters(vf)
