@@ -179,7 +179,109 @@ app.post('/caption', async (req, res) => {
   }
 });
 
+// ─── MUSIC (mix a background track into a video) ─────────────
+// Body: { video_url, audio_url, job_id, volume?, duck? }
+//   volume: 0..1 music level (default 0.35)
+//   duck:   true → auto-lower music under any speech (default true)
+// Loops the track to fill the video, ducks under speech, fades out the
+// tail, and keeps any original voice. Status via /status/:job_id.
+app.post('/music', async (req, res) => {
+  const { video_url, audio_url, job_id } = req.body || {};
+  const volume = Math.min(Math.max(parseFloat(req.body && req.body.volume) || 0.35, 0), 1);
+  const duck = (req.body && req.body.duck === false) ? false : true;
+  if (!video_url || !audio_url) {
+    return res.status(400).json({ error: 'video_url and audio_url required' });
+  }
+  console.log(`[${job_id}] Music job started — vol=${volume} duck=${duck}`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-mus-'));
+
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'Music started' });
+
+    const vPath = path.join(tmpDir, 'in.mp4');
+    const aPath = path.join(tmpDir, 'music' + (String(audio_url).match(/\.(mp3|wav|m4a|aac|ogg)(\?|$)/i) ? RegExp.$1 : 'mp3'));
+    await downloadFile(video_url, vPath);
+    await downloadFile(audio_url, aPath);
+
+    await updateJob(job_id, 'mixing');
+    const outPath = path.join(tmpDir, 'out.mp4');
+    await mixMusic(vPath, aPath, outPath, { volume: volume, duck: duck });
+
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadToSupabase(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] Music done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] Music error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+  }
+});
+
 // ─── HELPERS ─────────────────────────────────────────────────
+
+// Mix a looping background track into a video.
+//  - Loops music to fill the whole video (-stream_loop -1) then trims to length.
+//  - If the video has its own audio (voice) and duck=true, the music is
+//    side-chain compressed so it dips under speech, then the two are mixed.
+//  - If the video has no audio, the music simply plays under it.
+//  - Music tail fades out over ~1.5s.
+async function mixMusic(videoPath, audioPath, outPath, opts) {
+  opts = opts || {};
+  const vol = (opts.volume != null) ? opts.volume : 0.35;
+  const duck = opts.duck !== false;
+
+  const vProbe = await probeClip(videoPath);
+  const hasVoice = vProbe.hasAudio;
+  const dur = vProbe.duration || 0;
+  const fadeStart = Math.max(0, dur - 1.5);
+
+  return new Promise((resolve, reject) => {
+    const cmd = ffmpeg();
+    cmd.input(videoPath);
+    cmd.input(audioPath).inputOptions(['-stream_loop -1']); // loop music
+
+    let filter, mapAudio;
+    const musicChain =
+      '[1:a]volume=' + vol +
+      (dur ? (',afade=t=out:st=' + fadeStart.toFixed(2) + ':d=1.5') : '') +
+      '[mus]';
+
+    if (hasVoice && duck) {
+      // Duck music under the voice, then mix voice + ducked music.
+      filter =
+        musicChain + ';' +
+        '[mus][0:a]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300[ducked];' +
+        '[0:a][ducked]amix=inputs=2:duration=first:dropout_transition=0[aout]';
+      mapAudio = '[aout]';
+    } else if (hasVoice) {
+      filter = musicChain + ';[0:a][mus]amix=inputs=2:duration=first:dropout_transition=0[aout]';
+      mapAudio = '[aout]';
+    } else {
+      filter = musicChain;
+      mapAudio = '[mus]';
+    }
+
+    const outOpts = [
+      '-map', '0:v',
+      '-map', mapAudio,
+      '-c:v', 'copy',            // don't re-encode video — fast + lossless
+      '-c:a', 'aac', '-b:a', '192k',
+      '-shortest',               // stop at video length (music is looped/longer)
+      '-movflags', '+faststart'
+    ];
+
+    cmd.complexFilter(filter)
+      .outputOptions(outOpts)
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', (err) => reject(new Error('music ffmpeg error: ' + err.message)))
+      .run();
+  });
+}
 
 // Convert seconds -> ASS time "H:MM:SS.cs"
 function assTime(sec) {
