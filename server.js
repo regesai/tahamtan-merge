@@ -1,7 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
 // TAHAMTAN AI — Video Merge Service
 // Merges multiple AI video clips into one seamless MP4
-// Also persists single generated clips to R2 (permanent URLs)
 // Deploy on Railway.app — always on, no cold starts
 // ═══════════════════════════════════════════════════════════════
 
@@ -13,7 +12,6 @@ const fs      = require('fs');
 const path    = require('path');
 const os      = require('os');
 const { createClient } = require('@supabase/supabase-js');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -25,25 +23,28 @@ const supabase = (SUPABASE_URL && SUPABASE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_KEY)
   : null;
 
-// ── Cloudflare R2 (primary storage for merged videos) ─────────
-// Zero egress fees — the right home for video. Uses the S3-compatible API
-// with the R2_* variables already set on this Railway service.
-const R2_ACCOUNT_ID        = process.env.R2_ACCOUNT_ID        || '';
-const R2_ACCESS_KEY_ID     = process.env.R2_ACCESS_KEY_ID     || '';
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || '';
-const R2_BUCKET            = process.env.R2_BUCKET            || 'tahamtan-videos';
-const R2_PUBLIC_URL        = (process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
-
-const r2 = (R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY)
-  ? new S3Client({
-      region: 'auto',
-      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
-    })
-  : null;
-
-// Fallback bucket in Supabase Storage — used only if R2 is unavailable.
+// Bucket for merged videos — MUST exist in Supabase Storage and be public-read.
 const MERGE_BUCKET = process.env.MERGE_BUCKET || 'videos';
+
+// ── In-memory job status ──────────────────────────────────────
+// Authoritative source the browser polls via GET /status/:job_id.
+// Removes any dependency on Supabase RLS for the browser to read
+// merge results (browser anon key often can't SELECT merge_jobs).
+const jobs = {};
+function setJob(id, patch) {
+  if (!id) return;
+  jobs[id] = Object.assign(
+    { status: 'pending', url: null, error: null },
+    jobs[id] || {},
+    patch,
+    { updated: Date.now() }
+  );
+}
+// Evict jobs older than 1h so memory doesn't grow unbounded.
+setInterval(function () {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const k of Object.keys(jobs)) { if (jobs[k].updated < cutoff) delete jobs[k]; }
+}, 10 * 60 * 1000);
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -53,9 +54,16 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'tahamtan-merge', timestamp: new Date().toISOString() });
 });
 
-// ─── PROXY (CORS-safe playback for generated video URLs) ─────
-// NOTE: this only streams the upstream (temporary) URL — it does NOT persist.
-// Use /save to get a permanent R2 link.
+// ─── STATUS (browser polls this — always readable, no RLS) ───
+app.get('/status/:job_id', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const j = jobs[req.params.job_id];
+  if (!j) return res.json({ status: 'unknown' });
+  // Return the URL under every field name the frontend might read.
+  res.json({ status: j.status, url: j.url, output_url: j.url, video_url: j.url, error: j.error });
+});
+
+// ─── PROXY (for CORS issues with Atlas video URLs) ───────────
 app.get('/proxy', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'url param required' });
@@ -70,35 +78,6 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// ─── SAVE (persist a single generated clip to R2 permanently) ─
-// The frontend calls this the moment a single video is ready, passing the
-// provider's temporary URL (e.g. the volces / Seedance signed URL).
-// Returns a permanent R2 URL that never expires.
-//
-//   POST /save   { "url": "<provider temporary url>", "job_id": "optional" }
-//   → 200        { "status": "ok", "url": "<permanent R2 url>" }
-app.post('/save', async (req, res) => {
-  const { url, job_id } = req.body || {};
-  if (!url) return res.status(400).json({ error: 'url required' });
-
-  const id = job_id || `vid-${Date.now()}`;
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'save-'));
-  const localPath = path.join(tmpDir, 'video.mp4');
-
-  try {
-    console.log(`[${id}] Save requested — source: ${String(url).slice(0, 90)}...`);
-    await downloadFile(url, localPath);
-    const publicUrl = await storeMergedVideo(id, localPath, 'videos');
-    console.log(`[${id}] Saved to storage: ${publicUrl}`);
-    res.json({ status: 'ok', url: publicUrl });
-  } catch (err) {
-    console.error(`[${id}] Save failed:`, err.message);
-    res.status(500).json({ error: err.message });
-  } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
-  }
-});
-
 // ─── MERGE ───────────────────────────────────────────────────
 app.post('/merge', async (req, res) => {
   const { clips, job_id } = req.body;
@@ -108,6 +87,7 @@ app.post('/merge', async (req, res) => {
   }
 
   console.log(`[${job_id}] Merge job started — ${clips.length} clips`);
+  setJob(job_id, { status: 'processing' });
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-'));
 
   try {
@@ -143,9 +123,9 @@ app.post('/merge', async (req, res) => {
       console.log(`[${job_id}] Concat merge complete — ${outputFile}`);
     }
 
-    // 5. Upload to storage (R2 first, Supabase fallback)
+    // 5. Upload to Supabase Storage
     await updateJob(job_id, 'uploading');
-    const publicUrl = await storeMergedVideo(job_id, outputFile);
+    const publicUrl = await uploadToSupabase(job_id, outputFile);
 
     // 6. Done — update job with video URL
     await updateJob(job_id, 'done', publicUrl);
@@ -160,7 +140,115 @@ app.post('/merge', async (req, res) => {
   }
 });
 
+// ─── CAPTION (burn subtitles into a video) ───────────────────
+// Body: { video_url, cues:[{start,end,text}], job_id, rtl?, style? }
+//   start/end in seconds. Burns ASS subtitles into the MP4 (permanent),
+//   so captions survive download and sharing. Status via /status/:job_id.
+app.post('/caption', async (req, res) => {
+  const { video_url, cues, job_id, rtl, style } = req.body || {};
+  if (!video_url || !Array.isArray(cues) || cues.length === 0) {
+    return res.status(400).json({ error: 'video_url and non-empty cues[] required' });
+  }
+  console.log(`[${job_id}] Caption job started — ${cues.length} cues, rtl=${!!rtl}`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-cap-'));
+
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'Caption started' });
+
+    const inPath = path.join(tmpDir, 'in.mp4');
+    await downloadFile(video_url, inPath);
+
+    await updateJob(job_id, 'captioning');
+    const assPath = path.join(tmpDir, 'sub.ass');
+    fs.writeFileSync(assPath, buildAss(cues, { rtl: !!rtl, style: style || {} }));
+
+    const outPath = path.join(tmpDir, 'out.mp4');
+    await burnSubtitles(inPath, assPath, outPath, tmpDir);
+
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadToSupabase(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] Caption done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] Caption error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+  }
+});
+
 // ─── HELPERS ─────────────────────────────────────────────────
+
+// Convert seconds -> ASS time "H:MM:SS.cs"
+function assTime(sec) {
+  sec = Math.max(0, Number(sec) || 0);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  const cs = Math.round((sec - Math.floor(sec)) * 100);
+  const p2 = n => String(n).padStart(2, '0');
+  return h + ':' + p2(m) + ':' + p2(s) + '.' + p2(cs);
+}
+
+// Build a styled ASS subtitle file from cues. Social look: big bold text,
+// thick outline, bottom-centred. RTL-aware for fa/ar/ur.
+function buildAss(cues, opts) {
+  opts = opts || {};
+  const st = opts.style || {};
+  const fontName = st.font || 'Vazirmatn';      // ship this font in /fonts (covers fa/ar/ur/latin)
+  const fontSize = st.size || 22;
+  const primary  = st.primary  || '&H00FFFFFF';  // white   (AABBGGRR)
+  const outline  = st.outline  || '&H00000000';  // black
+  const outlineW = (st.outlineW != null) ? st.outlineW : 3;
+  const shadow   = (st.shadow  != null) ? st.shadow  : 1;
+  const marginV  = st.marginV || 40;
+  const bold     = st.bold === false ? 0 : -1;
+
+  const header =
+    '[Script Info]\n' +
+    'ScriptType: v4.00+\n' +
+    'PlayResX: 1280\n' +
+    'PlayResY: 720\n' +
+    'WrapStyle: 2\n' +
+    'ScaledBorderAndShadow: yes\n\n' +
+    '[V4+ Styles]\n' +
+    'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n' +
+    'Style: Default,' + fontName + ',' + fontSize + ',' + primary + ',&H000000FF,' + outline + ',&H64000000,' +
+      bold + ',0,0,0,100,100,0,0,1,' + outlineW + ',' + shadow + ',2,40,40,' + marginV + ',1\n\n' +
+    '[Events]\n' +
+    'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
+
+  const rtlMark = opts.rtl ? '\u202B' : ''; // RLE embedding for correct RTL order
+  const lines = cues.map(function (c) {
+    const text = String(c.text || '')
+      .replace(/\r?\n/g, '\\N')                    // ASS line break
+      .replace(/\{/g, '(').replace(/\}/g, ')');    // strip ASS override braces
+    return 'Dialogue: 0,' + assTime(c.start) + ',' + assTime(c.end) +
+      ',Default,,0,0,0,,' + rtlMark + text;
+  }).join('\n');
+
+  return header + lines + '\n';
+}
+
+// Burn the ASS file into the video. Re-encodes video, copies audio.
+// fontsdir lets us ship a font that covers Persian/Arabic/Urdu.
+function burnSubtitles(inPath, assPath, outPath, workDir) {
+  return new Promise((resolve, reject) => {
+    const escaped = assPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+    const fontsDir = (process.env.FONTS_DIR || (__dirname + '/fonts')).replace(/\\/g, '/').replace(/:/g, '\\:');
+    const vf = "ass='" + escaped + "':fontsdir='" + fontsDir + "'";
+    ffmpeg()
+      .input(inPath)
+      .videoFilters(vf)
+      .outputOptions(['-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-c:a copy', '-movflags +faststart'])
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', (err) => reject(new Error('caption ffmpeg error: ' + err.message)))
+      .run();
+  });
+}
 
 async function downloadFile(url, dest) {
   const r = await fetch(url, { timeout: 60000 });
@@ -250,50 +338,37 @@ async function mergeVideosSmooth(files, outputFile) {
   });
 }
 
-// Store a video permanently. R2 first (zero egress — free to serve),
-// Supabase Storage as fallback so a job never dies just because R2 hiccuped.
-// `prefix` controls the folder in the bucket: 'merged' (default) or 'videos'.
-async function storeMergedVideo(job_id, filePath, prefix = 'merged') {
-  const fileBuffer = fs.readFileSync(filePath);
-  const fileName   = `${prefix}/${job_id}-${Date.now()}.mp4`;
-
-  // 1. R2 (primary)
-  if (r2 && R2_PUBLIC_URL) {
-    try {
-      await r2.send(new PutObjectCommand({
-        Bucket: R2_BUCKET,
-        Key: fileName,
-        Body: fileBuffer,
-        ContentType: 'video/mp4',
-      }));
-      const url = `${R2_PUBLIC_URL}/${fileName}`;
-      console.log(`[${job_id}] Stored on R2: ${url}`);
-      return url;
-    } catch (e) {
-      console.error(`[${job_id}] R2 upload failed (falling back to Supabase):`, e.message);
-    }
-  } else {
-    console.warn(`[${job_id}] R2 not configured (need R2_ACCOUNT_ID / keys / R2_PUBLIC_URL) — using Supabase Storage`);
+async function uploadToSupabase(job_id, filePath) {
+  if (!supabase) {
+    // No Supabase — return local file as base64 data URL (fallback)
+    console.warn('No Supabase configured — cannot upload merged video');
+    throw new Error('Supabase not configured for video storage');
   }
+  const fileBuffer = fs.readFileSync(filePath);
+  const fileName   = `merged/${job_id}-${Date.now()}.mp4`;
 
-  // 2. Supabase Storage (fallback)
-  if (!supabase) throw new Error('Neither R2 nor Supabase available for video storage');
   const { error } = await supabase.storage
     .from(MERGE_BUCKET)
     .upload(fileName, fileBuffer, { contentType: 'video/mp4', upsert: true });
+
   if (error) throw new Error('Supabase upload failed: ' + error.message);
+
   const { data } = supabase.storage.from(MERGE_BUCKET).getPublicUrl(fileName);
-  console.log(`[${job_id}] Stored on Supabase (fallback): ${data.publicUrl}`);
   return data.publicUrl;
 }
 
 async function updateJob(job_id, status, video_url = null, error = null) {
+  // In-memory first — this is what the browser polls via /status/:job_id.
+  setJob(job_id, { status, url: video_url || (jobs[job_id] && jobs[job_id].url) || null, error });
+
   if (!supabase || !job_id) return;
   try {
-    const update = { status, updated_at: new Date().toISOString() };
-    if (video_url) update.video_url = video_url;
-    if (error)     update.error     = error;
-    await supabase.from('merge_jobs').update(update).eq('id', job_id);
+    // UPSERT (not update): the browser's anon insert may have been blocked by
+    // RLS, so the row might not exist yet. Upsert guarantees the write lands.
+    const row = { id: job_id, status, updated_at: new Date().toISOString() };
+    if (video_url) row.video_url = video_url;
+    if (error)     row.error     = error;
+    await supabase.from('merge_jobs').upsert(row, { onConflict: 'id' });
   } catch(e) {
     console.warn('Supabase update skipped:', e.message);
   }
