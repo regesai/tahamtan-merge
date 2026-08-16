@@ -125,7 +125,7 @@ app.post('/merge', async (req, res) => {
 
     // 5. Upload to Supabase Storage
     await updateJob(job_id, 'uploading');
-    const publicUrl = await uploadToSupabase(job_id, outputFile);
+    const publicUrl = await uploadOutput(job_id, outputFile);
 
     // 6. Done — update job with video URL
     await updateJob(job_id, 'done', publicUrl);
@@ -168,7 +168,7 @@ app.post('/caption', async (req, res) => {
     await burnSubtitles(inPath, assPath, outPath, tmpDir);
 
     await updateJob(job_id, 'uploading');
-    const publicUrl = await uploadToSupabase(job_id, outPath);
+    const publicUrl = await uploadOutput(job_id, outPath);
     await updateJob(job_id, 'done', publicUrl);
     console.log(`[${job_id}] Caption done — ${publicUrl}`);
   } catch (err) {
@@ -210,7 +210,7 @@ app.post('/music', async (req, res) => {
     await mixMusic(vPath, aPath, outPath, { volume: volume, duck: duck });
 
     await updateJob(job_id, 'uploading');
-    const publicUrl = await uploadToSupabase(job_id, outPath);
+    const publicUrl = await uploadOutput(job_id, outPath);
     await updateJob(job_id, 'done', publicUrl);
     console.log(`[${job_id}] Music done — ${publicUrl}`);
   } catch (err) {
@@ -458,11 +458,75 @@ async function mergeVideosSmooth(files, outputFile) {
   });
 }
 
+// ─── OUTPUT STORAGE ──────────────────────────────────────────
+// Prefer Cloudflare R2 (the rest of the stack uses R2). Falls back to
+// Supabase Storage only if R2 isn't configured.
+const R2_ACCOUNT   = process.env.CF_ACCOUNT_ID || '';
+const R2_BUCKET    = process.env.R2_BUCKET || 'tahamtan-videos';
+const R2_KEY_ID    = process.env.R2_ACCESS_KEY_ID || '';
+const R2_SECRET    = process.env.R2_SECRET_ACCESS_KEY || '';
+const R2_PUBLIC    = (process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
+const R2_HOST      = R2_ACCOUNT ? `${R2_ACCOUNT}.r2.cloudflarestorage.com` : '';
+
+function r2Ready() { return !!(R2_ACCOUNT && R2_KEY_ID && R2_SECRET && R2_PUBLIC); }
+
+function r2sha256hex(d){ return require('crypto').createHash('sha256').update(d).digest('hex'); }
+function r2hmac(k, d){ return require('crypto').createHmac('sha256', k).update(d).digest(); }
+
+// SigV4-signed PUT to R2 (path-style). Returns the public URL.
+async function uploadToR2(job_id, filePath) {
+  const crypto = require('crypto');
+  const body = fs.readFileSync(filePath);
+  const key = `merged/${job_id}-${Date.now()}.mp4`;
+  const now = new Date();
+  const amzdate = now.toISOString().replace(/[:-]/g, '').replace(/\.\d{3}/, '');
+  const datestamp = amzdate.slice(0, 8);
+  const region = 'auto', service = 's3';
+  const scope = `${datestamp}/${region}/${service}/aws4_request`;
+  const canonicalUri = '/' + R2_BUCKET + '/' + key.split('/').map(encodeURIComponent).join('/');
+  const payloadHash = r2sha256hex(body);
+  const canonicalHeaders =
+    `host:${R2_HOST}\n` +
+    `x-amz-content-sha256:${payloadHash}\n` +
+    `x-amz-date:${amzdate}\n`;
+  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+  const canonicalRequest = ['PUT', canonicalUri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const stringToSign = ['AWS4-HMAC-SHA256', amzdate, scope, r2sha256hex(canonicalRequest)].join('\n');
+  const kDate = r2hmac('AWS4' + R2_SECRET, datestamp);
+  const kRegion = r2hmac(kDate, region);
+  const kService = r2hmac(kRegion, service);
+  const kSigning = r2hmac(kService, 'aws4_request');
+  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex');
+  const authorization = `AWS4-HMAC-SHA256 Credential=${R2_KEY_ID}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const res = await fetch(`https://${R2_HOST}${canonicalUri}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': authorization,
+      'x-amz-content-sha256': payloadHash,
+      'x-amz-date': amzdate,
+      'Content-Type': 'video/mp4',
+      'Content-Length': body.length,
+    },
+    body,
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error('R2 upload failed ' + res.status + ' ' + t.slice(0, 200));
+  }
+  return `${R2_PUBLIC}/${key}`;
+}
+
+// Unified output upload: R2 first, Supabase fallback.
+async function uploadOutput(job_id, filePath) {
+  if (r2Ready()) return uploadToR2(job_id, filePath);
+  return uploadToSupabase(job_id, filePath);
+}
+
 async function uploadToSupabase(job_id, filePath) {
   if (!supabase) {
-    // No Supabase — return local file as base64 data URL (fallback)
-    console.warn('No Supabase configured — cannot upload merged video');
-    throw new Error('Supabase not configured for video storage');
+    console.warn('No storage configured — set R2_* env vars on Railway.');
+    throw new Error('No output storage configured (set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, CF_ACCOUNT_ID, R2_PUBLIC_URL).');
   }
   const fileBuffer = fs.readFileSync(filePath);
   const fileName   = `merged/${job_id}-${Date.now()}.mp4`;
