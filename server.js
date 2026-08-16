@@ -348,13 +348,16 @@ function buildAss(cues, opts) {
     '[Events]\n' +
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
 
-  const rtlMark = opts.rtl ? '\u202B' : ''; // RLE embedding for correct RTL order
+  const isRtl = !!opts.rtl;
   const lines = cues.map(function (c) {
-    const text = String(c.text || '')
+    var text = String(c.text || '')
       .replace(/\r?\n/g, '\\N')                    // ASS line break
       .replace(/\{/g, '(').replace(/\}/g, ')');    // strip ASS override braces
+    // For Arabic/Persian/Urdu: wrap the line in an explicit RTL embedding
+    // (RLE … PDF) so word order and mixed numbers/Latin render correctly.
+    if (isRtl) text = '\u202B' + text + '\u202C';
     return 'Dialogue: 0,' + assTime(c.start) + ',' + assTime(c.end) +
-      ',Default,,0,0,0,,' + rtlMark + text;
+      ',Default,,0,0,0,,' + text;
   }).join('\n');
 
   return header + lines + '\n';
