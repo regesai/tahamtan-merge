@@ -193,6 +193,42 @@ app.post('/caption', async (req, res) => {
   }
 });
 
+// ─── FINALIZE (optimize for social platforms) ───────────────
+// Body: { video_url, job_id, boost? }
+// Re-wraps the video as a clean 1080x1920 H.264/AAC file with BT.709
+// color and a healthy bitrate, plus a light brightness/shadow/saturation
+// lift so it survives TikTok/Reels/Shorts compression without darkening.
+app.post('/finalize', async (req, res) => {
+  const { video_url, job_id } = req.body || {};
+  const boost = (req.body && req.body.boost === false) ? false : true;
+  if (!video_url) return res.status(400).json({ error: 'video_url required' });
+  console.log(`[${job_id}] Finalize job started — boost=${boost}`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-fin-'));
+
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'Finalize started' });
+
+    const inPath = path.join(tmpDir, 'in.mp4');
+    await downloadFile(video_url, inPath);
+
+    await updateJob(job_id, 'optimizing');
+    const outPath = path.join(tmpDir, 'out.mp4');
+    await finalizeForSocial(inPath, outPath, { boost: boost });
+
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] Finalize done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] Finalize error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+  }
+});
+
 // ─── MUSIC (mix a background track into a video) ─────────────
 // Body: { video_url, audio_url, job_id, volume?, duck? }
 //   volume: 0..1 music level (default 0.35)
@@ -361,6 +397,50 @@ function buildAss(cues, opts) {
   }).join('\n');
 
   return header + lines + '\n';
+}
+
+// Optimize a video for social platforms (TikTok / Reels / Shorts):
+//  - scale/pad to a clean 1080x1920 (9:16) container
+//  - H.264 High, yuv420p, BT.709 color tags (stops HDR darkening/shift)
+//  - ~12 Mbps target so the platform transcoder gets a clean source
+//  - light brightness + shadow lift + saturation so it survives the crush
+//  - 30fps, AAC 192k, +faststart
+function finalizeForSocial(inPath, outPath, opts) {
+  opts = opts || {};
+  const boost = opts.boost !== false;
+  return new Promise((resolve, reject) => {
+    // Fit any aspect into 1080x1920 without distortion, pad with black.
+    let vf =
+      "scale=1080:1920:force_original_aspect_ratio=decrease," +
+      "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black," +
+      "setsar=1,format=yuv420p";
+    if (boost) {
+      // eq: tiny brightness + saturation; curves: lift shadows a touch.
+      vf = "scale=1080:1920:force_original_aspect_ratio=decrease," +
+           "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black," +
+           "eq=brightness=0.03:saturation=1.08:contrast=1.03," +
+           "curves=all='0/0.03 0.5/0.52 1/1'," +
+           "setsar=1,format=yuv420p";
+    }
+    ffmpeg()
+      .input(inPath)
+      .videoFilters(vf)
+      .outputOptions([
+        '-r', '30',
+        '-c:v', 'libx264',
+        '-profile:v', 'high',
+        '-preset', 'medium',
+        '-b:v', '12M', '-maxrate', '14M', '-bufsize', '20M',
+        '-pix_fmt', 'yuv420p',
+        '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
+        '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+        '-movflags', '+faststart'
+      ])
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', (err) => reject(new Error('finalize ffmpeg error: ' + err.message)))
+      .run();
+  });
 }
 
 // Burn the ASS file into the video. Re-encodes video, copies audio.
