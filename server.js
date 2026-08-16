@@ -16,12 +16,26 @@ const { createClient } = require('@supabase/supabase-js');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// Supabase (optional — for job status updates)
-const SUPABASE_URL  = process.env.SUPABASE_URL  || '';
-const SUPABASE_KEY  = process.env.SUPABASE_KEY  || '';
-const supabase = (SUPABASE_URL && SUPABASE_KEY)
-  ? createClient(SUPABASE_URL, SUPABASE_KEY)
-  : null;
+// Supabase (optional — only used as a fallback; primary storage is R2).
+// Wrapped in try/catch and a URL sanity check so a malformed SUPABASE_URL
+// can NEVER take the whole server down at boot (this was crashing Railway
+// inside RealtimeClient._initializeOptions).
+const SUPABASE_URL  = (process.env.SUPABASE_URL  || '').trim().replace(/\/+$/, '');
+const SUPABASE_KEY  = (process.env.SUPABASE_KEY  || '').trim();
+let supabase = null;
+try {
+  if (/^https:\/\/.+/.test(SUPABASE_URL) && SUPABASE_KEY) {
+    supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+      auth: { persistSession: false },
+      realtime: { params: { eventsPerSecond: 1 } },
+    });
+  } else if (SUPABASE_URL || SUPABASE_KEY) {
+    console.warn('Supabase not initialised — SUPABASE_URL must start with https:// and SUPABASE_KEY must be set. Using R2 only.');
+  }
+} catch (e) {
+  console.warn('Supabase init skipped (' + (e && e.message) + '). Using R2 only.');
+  supabase = null;
+}
 
 // Bucket for merged videos — MUST exist in Supabase Storage and be public-read.
 const MERGE_BUCKET = process.env.MERGE_BUCKET || 'videos';
