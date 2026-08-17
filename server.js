@@ -193,6 +193,230 @@ app.post('/caption', async (req, res) => {
   }
 });
 
+// ─── SPEED (slow-mo / fast, 0.25x–4x) ───────────────────────
+app.post('/speed', async (req, res) => {
+  const { video_url, job_id } = req.body || {};
+  const rate = Math.min(Math.max(parseFloat(req.body && req.body.rate) || 1, 0.25), 4);
+  if (!video_url) return res.status(400).json({ error: 'video_url required' });
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-spd-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(video_url, inP);
+    await updateJob(job_id, 'processing');
+    await changeSpeed(inP, outP, rate);
+    await updateJob(job_id, 'uploading');
+    await updateJob(job_id, 'done', await uploadOutput(job_id, outP));
+  } catch (e) { await updateJob(job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── SPLIT (keep one part, or remove a middle section) ──────
+// mode 'keep': output [start,end].  mode 'remove': output everything EXCEPT [start,end].
+app.post('/split', async (req, res) => {
+  const { video_url, job_id } = req.body || {};
+  const mode = (req.body && req.body.mode) === 'remove' ? 'remove' : 'keep';
+  const start = Math.max(0, parseFloat(req.body && req.body.start) || 0);
+  const end = parseFloat(req.body && req.body.end);
+  if (!video_url) return res.status(400).json({ error: 'video_url required' });
+  if (!(end > start)) return res.status(400).json({ error: 'end must be greater than start' });
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-spl-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(video_url, inP);
+    await updateJob(job_id, 'processing');
+    if (mode === 'keep') { await trimClip(inP, outP, start, end); }
+    else { await removeSection(inP, outP, start, end, tmpDir); }
+    await updateJob(job_id, 'uploading');
+    await updateJob(job_id, 'done', await uploadOutput(job_id, outP));
+  } catch (e) { await updateJob(job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── STICKER / EMOJI overlay (burn a large emoji at a position) ──
+// Body: { video_url, job_id, emoji, pos?('tl'|'tr'|'bl'|'br'|'center'), size? }
+app.post('/sticker', async (req, res) => {
+  const b = req.body || {};
+  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
+  if (!b.emoji) return res.status(400).json({ error: 'emoji required' });
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-stk-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(b.video_url, inP);
+    await updateJob(b.job_id, 'processing');
+    await burnSticker(inP, outP, tmpDir, b);
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
+  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── VOLUME (adjust original audio volume, 0–2x; 0 = mute) ──────
+app.post('/volume', async (req, res) => {
+  const b = req.body || {};
+  const vol = Math.min(Math.max(parseFloat(b.volume), 0), 2);
+  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
+  if (isNaN(vol)) return res.status(400).json({ error: 'volume required (0–2)' });
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-vol-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(b.video_url, inP);
+    await updateJob(b.job_id, 'processing');
+    await setVolume(inP, outP, vol);
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
+  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── TEXT overlay (burn a title on screen) ──────────────────
+// Body: { video_url, job_id, text, pos?('top'|'center'|'bottom'), lang?, start?, end? }
+app.post('/text', async (req, res) => {
+  const b = req.body || {};
+  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
+  if (!b.text) return res.status(400).json({ error: 'text required' });
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-txt-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(b.video_url, inP);
+    await updateJob(b.job_id, 'processing');
+    await burnText(inP, outP, tmpDir, b);
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
+  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── FILTER / colour grade (preset or manual) ───────────────
+// Body: { video_url, job_id, preset?, brightness?, contrast?, saturation? }
+app.post('/filter', async (req, res) => {
+  const b = req.body || {};
+  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-flt-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(b.video_url, inP);
+    await updateJob(b.job_id, 'processing');
+    await applyFilter(inP, outP, b);
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
+  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── REFRAME (aspect ratio: 9:16, 1:1, 16:9) ────────────────
+app.post('/reframe', async (req, res) => {
+  const b = req.body || {};
+  const ar = ['9:16', '1:1', '16:9'].includes(b.aspect) ? b.aspect : '9:16';
+  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-rfr-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(b.video_url, inP);
+    await updateJob(b.job_id, 'processing');
+    await reframe(inP, outP, ar);
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
+  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── FADE (fade in + fade out, video + audio) ───────────────
+app.post('/fade', async (req, res) => {
+  const b = req.body || {};
+  const dur = Math.min(Math.max(parseFloat(b.fade) || 1, 0.2), 3);
+  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-fad-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(b.video_url, inP);
+    await updateJob(b.job_id, 'processing');
+    await addFade(inP, outP, dur);
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
+  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── FREEZE (hold a frame for N seconds at time T) ──────────
+app.post('/freeze', async (req, res) => {
+  const b = req.body || {};
+  const at = Math.max(0, parseFloat(b.at) || 0);
+  const hold = Math.min(Math.max(parseFloat(b.hold) || 1.5, 0.3), 5);
+  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-frz-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(b.video_url, inP);
+    await updateJob(b.job_id, 'processing');
+    await freezeFrame(inP, outP, at, hold, tmpDir);
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
+  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── TRIM (cut a start/end range from a video) ──────────────
+// Body: { video_url, job_id, start, end }  (start/end in seconds)
+app.post('/trim', async (req, res) => {
+  const { video_url, job_id } = req.body || {};
+  const start = Math.max(0, parseFloat(req.body && req.body.start) || 0);
+  const end = parseFloat(req.body && req.body.end);
+  if (!video_url) return res.status(400).json({ error: 'video_url required' });
+  if (!(end > start)) return res.status(400).json({ error: 'end must be greater than start' });
+  console.log(`[${job_id}] Trim job started — ${start}s to ${end}s`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-trim-'));
+
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'Trim started' });
+
+    const inPath = path.join(tmpDir, 'in.mp4');
+    await downloadFile(video_url, inPath);
+
+    await updateJob(job_id, 'trimming');
+    const outPath = path.join(tmpDir, 'out.mp4');
+    await trimClip(inPath, outPath, start, end);
+
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] Trim done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] Trim error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+  }
+});
+
 // ─── FINALIZE (optimize for social platforms) ───────────────
 // Body: { video_url, job_id, boost? }
 // Re-wraps the video as a clean 1080x1920 H.264/AAC file with BT.709
@@ -405,6 +629,191 @@ function buildAss(cues, opts) {
 //  - ~12 Mbps target so the platform transcoder gets a clean source
 //  - light brightness + shadow lift + saturation so it survives the crush
 //  - 30fps, AAC 192k, +faststart
+// Change playback speed (video setpts + audio atempo, chained for range).
+function changeSpeed(inPath, outPath, rate) {
+  // atempo supports 0.5–2.0 per filter; chain for wider range.
+  let a = [], r = rate;
+  while (r > 2.0) { a.push('atempo=2.0'); r /= 2.0; }
+  while (r < 0.5) { a.push('atempo=0.5'); r /= 0.5; }
+  a.push('atempo=' + r.toFixed(4));
+  const vpts = (1 / rate).toFixed(4);
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(inPath)
+      .complexFilter([`[0:v]setpts=${vpts}*PTS[v]`, `[0:a]${a.join(',')}[a]`])
+      .outputOptions(['-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('speed: ' + e.message))).run();
+  });
+}
+
+// Remove the [start,end] section: cut the two surrounding parts and concat.
+async function removeSection(inPath, outPath, start, end, dir) {
+  const probe = await probeClip(inPath);
+  const total = probe.duration || 0;
+  const partA = path.join(dir, 'a.mp4'), partB = path.join(dir, 'b.mp4');
+  const jobs = [];
+  if (start > 0.05) jobs.push(trimClip(inPath, partA, 0, start).then(() => partA));
+  if (end < total - 0.05) jobs.push(trimClip(inPath, partB, end, total).then(() => partB));
+  const parts = await Promise.all(jobs);
+  if (parts.length === 1) { fs.copyFileSync(parts[0], outPath); return; }
+  const listFile = path.join(dir, 'list.txt');
+  fs.writeFileSync(listFile, parts.map(p => `file '${p}'`).join('\n'));
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(listFile).inputOptions(['-f', 'concat', '-safe', '0'])
+      .outputOptions(['-c', 'copy', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('split: ' + e.message))).run();
+  });
+}
+
+// Burn a big emoji/sticker at a corner or center using drawtext (color emoji font).
+function burnSticker(inPath, outPath, dir, b) {
+  const size = Math.min(Math.max(parseInt(b.size) || 160, 48), 400);
+  const m = 40; // margin from edges
+  const posMap = {
+    tl: `x=${m}:y=${m}`,
+    tr: `x=w-tw-${m}:y=${m}`,
+    bl: `x=${m}:y=h-th-${m}`,
+    br: `x=w-tw-${m}:y=h-th-${m}`,
+    center: `x=(w-tw)/2:y=(h-th)/2`,
+  };
+  const pos = posMap[b.pos] || posMap.br;
+  // write emoji to a text file to avoid shell-escaping issues
+  const txtFile = path.join(dir, 'emoji.txt');
+  fs.writeFileSync(txtFile, String(b.emoji));
+  const vf = `drawtext=fontfile=/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf:textfile='${txtFile}':fontsize=${size}:${pos}`;
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(inPath).videoFilters(vf)
+      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('sticker: ' + e.message))).run();
+  });
+}
+
+// Adjust original audio volume (0 mutes, 1 unchanged, 2 = 2x).
+function setVolume(inPath, outPath, vol) {
+  return new Promise((resolve, reject) => {
+    const cmd = ffmpeg().input(inPath);
+    if (vol === 0) {
+      cmd.outputOptions(['-an', '-c:v', 'copy', '-movflags', '+faststart']);
+    } else {
+      cmd.audioFilters(`volume=${vol}`)
+        .outputOptions(['-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart']);
+    }
+    cmd.output(outPath).on('end', resolve).on('error', e => reject(new Error('volume: ' + e.message))).run();
+  });
+}
+
+// Burn a single styled text/title using an ASS file (reuses buildAss styling).
+function burnText(inPath, outPath, dir, b) {
+  const pos = b.pos === 'top' ? 8 : b.pos === 'center' ? 5 : 2;   // ASS alignment
+  const dur = (b.end != null && b.start != null) ? null : null;
+  const start = b.start != null ? Number(b.start) : 0;
+  const probeEnd = b.end != null ? Number(b.end) : 999;
+  const rtl = ['ar', 'fa', 'ur'].includes(String(b.lang || '').toLowerCase());
+  const cues = [{ start: start, end: probeEnd, text: String(b.text) }];
+  const ass = buildAss(cues, { rtl: rtl, lang: b.lang || '', style: { size: 32, marginV: pos === 5 ? 0 : 60 } });
+  // force alignment
+  const ass2 = ass.replace(/,2,40,40,\d+,1/, `,${pos},40,40,${pos === 5 ? 0 : 60},1`);
+  const assPath = path.join(dir, 't.ass');
+  fs.writeFileSync(assPath, ass2);
+  return burnSubtitles(inPath, assPath, outPath, dir);
+}
+
+// Colour grade: presets or manual eq values.
+function applyFilter(inPath, outPath, b) {
+  const presets = {
+    vivid:   'eq=saturation=1.4:contrast=1.15:brightness=0.03',
+    warm:    'eq=saturation=1.15:gamma_r=1.08:gamma_b=0.95',
+    cool:    'eq=saturation=1.1:gamma_b=1.08:gamma_r=0.95',
+    bw:      'hue=s=0,eq=contrast=1.15',
+    cinema:  'curves=all=\'0/0.05 0.5/0.5 1/0.95\',eq=saturation=1.05:contrast=1.1',
+    bright:  'eq=brightness=0.08:saturation=1.1',
+  };
+  let vf = presets[b.preset];
+  if (!vf) {
+    const br = (parseFloat(b.brightness) || 0);
+    const co = (parseFloat(b.contrast) || 1);
+    const sa = (parseFloat(b.saturation) || 1);
+    vf = `eq=brightness=${br}:contrast=${co}:saturation=${sa}`;
+  }
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(inPath).videoFilters(vf)
+      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('filter: ' + e.message))).run();
+  });
+}
+
+// Reframe to an aspect ratio (fit + black pad, no distortion).
+function reframe(inPath, outPath, aspect) {
+  const dims = { '9:16': [1080, 1920], '1:1': [1080, 1080], '16:9': [1920, 1080] }[aspect];
+  const [w, h] = dims;
+  const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(inPath).videoFilters(vf)
+      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('reframe: ' + e.message))).run();
+  });
+}
+
+// Fade in + fade out on video and audio.
+async function addFade(inPath, outPath, d) {
+  const probe = await probeClip(inPath);
+  const total = probe.duration || 0;
+  const outStart = Math.max(0, total - d).toFixed(2);
+  const vf = `fade=t=in:st=0:d=${d},fade=t=out:st=${outStart}:d=${d}`;
+  const af = `afade=t=in:st=0:d=${d},afade=t=out:st=${outStart}:d=${d}`;
+  return new Promise((resolve, reject) => {
+    const cmd = ffmpeg().input(inPath).videoFilters(vf);
+    if (probe.hasAudio) cmd.audioFilters(af);
+    cmd.outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('fade: ' + e.message))).run();
+  });
+}
+
+// Freeze a frame at time `at` for `hold` seconds (split, still, concat).
+async function freezeFrame(inPath, outPath, at, hold, dir) {
+  const probe = await probeClip(inPath);
+  const total = probe.duration || 0;
+  const before = path.join(dir, 'bf.mp4'), still = path.join(dir, 'st.mp4'), after = path.join(dir, 'af.mp4');
+  const png = path.join(dir, 'frame.png');
+  // grab the frame
+  await new Promise((res, rej) => ffmpeg().input(inPath).seekInput(at).frames(1).output(png).on('end', res).on('error', e => rej(new Error('freeze grab: ' + e.message))).run());
+  // make a still clip of `hold` secs (silent)
+  await new Promise((res, rej) => ffmpeg().input(png).loop(hold).inputOptions(['-framerate', '30'])
+    .outputOptions(['-t', String(hold), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2'])
+    .output(still).on('end', res).on('error', e => rej(new Error('freeze still: ' + e.message))).run());
+  const parts = [];
+  await trimClip(inPath, before, 0, at); parts.push(before);
+  parts.push(still);
+  if (at < total - 0.05) { await trimClip(inPath, after, at, total); parts.push(after); }
+  const listFile = path.join(dir, 'fl.txt');
+  fs.writeFileSync(listFile, parts.map(p => `file '${p}'`).join('\n'));
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(listFile).inputOptions(['-f', 'concat', '-safe', '0'])
+      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('freeze concat: ' + e.message))).run();
+  });
+}
+
+// Cut [start, end] (seconds) from a video. Re-encodes for frame-accurate cuts.
+function trimClip(inPath, outPath, start, end) {
+  const dur = Math.max(0.1, end - start);
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(inPath)
+      .setStartTime(start)
+      .duration(dur)
+      .outputOptions([
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '192k',
+        '-movflags', '+faststart'
+      ])
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', (err) => reject(new Error('trim ffmpeg error: ' + err.message)))
+      .run();
+  });
+}
+
 function finalizeForSocial(inPath, outPath, opts) {
   opts = opts || {};
   const boost = opts.boost !== false;
