@@ -382,6 +382,104 @@ app.post('/freeze', async (req, res) => {
   finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
 });
 
+// ─── SPLIT-SCREEN / BEFORE-AFTER (two videos side by side or stacked) ──
+// Body: { left_url, right_url, job_id, layout?('side'|'stack'), aspect?('9:16'|'1:1'|'16:9') }
+app.post('/split-screen', async (req, res) => {
+  const b = req.body || {};
+  if (!b.left_url || !b.right_url) return res.status(400).json({ error: 'left_url and right_url required' });
+  const layout = b.layout === 'stack' ? 'stack' : 'side';
+  const aspect = ['9:16', '1:1', '16:9'].includes(b.aspect) ? b.aspect : '9:16';
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-ss-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+    const lp = path.join(tmpDir, 'l.mp4'), rp = path.join(tmpDir, 'r.mp4'), out = path.join(tmpDir, 'out.mp4');
+    await downloadFile(b.left_url, lp);
+    await downloadFile(b.right_url, rp);
+    await updateJob(b.job_id, 'processing');
+    await splitScreen(lp, rp, out, layout, aspect);
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, out));
+  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── EFFECTS / overlays (glow, sparkle, vignette, vhs, etc.) ──
+// Body: { video_url, job_id, effect }
+app.post('/effect', async (req, res) => {
+  const b = req.body || {};
+  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-fx-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
+    await downloadFile(b.video_url, inP);
+    await updateJob(b.job_id, 'processing');
+    await applyEffect(inP, outP, b.effect);
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
+  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
+  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
+// ─── PHOTO → VIDEO (Ken Burns zoom/pan motion on stills) ────
+// Body: { images:[url,...], job_id, perImage?(sec), motion?('zoom'|'pan'|'auto'),
+//         transition?('fade'|'none'), music_url?, aspect?('9:16'|'1:1'|'16:9') }
+app.post('/photo-video', async (req, res) => {
+  const b = req.body || {};
+  const images = Array.isArray(b.images) ? b.images.filter(Boolean) : [];
+  if (!images.length) return res.status(400).json({ error: 'images array required' });
+  const per = Math.min(Math.max(parseFloat(b.perImage) || 3, 1.5), 8);
+  const aspect = ['9:16', '1:1', '16:9'].includes(b.aspect) ? b.aspect : '9:16';
+  const useXfade = (b.transition === 'fade');
+  setJob(b.job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-p2v-'));
+  try {
+    await updateJob(b.job_id, 'downloading');
+    res.json({ status: 'processing', job_id: b.job_id });
+
+    // 1) download all images
+    const localImgs = [];
+    for (let i = 0; i < images.length; i++) {
+      const p = path.join(tmpDir, 'img' + i + path.extname(images[i].split('?')[0]) || '.jpg');
+      await downloadFile(images[i], p);
+      localImgs.push(p);
+    }
+
+    await updateJob(b.job_id, 'processing');
+    const dims = { '9:16': [1080, 1920], '1:1': [1080, 1080], '16:9': [1920, 1080] }[aspect];
+    const clips = [];
+    // 2) make a Ken Burns clip per image
+    for (let i = 0; i < localImgs.length; i++) {
+      const out = path.join(tmpDir, 'clip' + i + '.mp4');
+      await kenBurns(localImgs[i], out, per, dims, i % 4);
+      clips.push(out);
+    }
+
+    // 3) join (with or without crossfade), then optional music
+    const joined = path.join(tmpDir, 'joined.mp4');
+    if (useXfade && clips.length > 1) await xfadeJoin(clips, joined, per, tmpDir);
+    else await concatClips(clips, joined, tmpDir);
+
+    let finalOut = joined;
+    if (b.music_url) {
+      const mp = path.join(tmpDir, 'music.mp3');
+      await downloadFile(b.music_url, mp);
+      finalOut = path.join(tmpDir, 'final.mp4');
+      await addBgMusicSimple(joined, mp, finalOut);
+    }
+
+    await updateJob(b.job_id, 'uploading');
+    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, finalOut));
+  } catch (e) {
+    console.error('[' + b.job_id + '] photo-video error:', e.message);
+    await updateJob(b.job_id, 'error', null, e.message);
+  } finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
+});
+
 // ─── TRIM (cut a start/end range from a video) ──────────────
 // Body: { video_url, job_id, start, end }  (start/end in seconds)
 app.post('/trim', async (req, res) => {
@@ -580,12 +678,33 @@ function fontForLang(lang) {
   }
 }
 
+// Pick the caption font: honor the user's choice ONLY if it can render the
+// language's script; otherwise fall back to the correct script font so
+// Persian/Arabic/etc. never break.
+function pickFont(chosen, lang) {
+  const l = String(lang || '').toLowerCase();
+  const scriptFont = fontForLang(l);
+  if (!chosen) return scriptFont;
+  // Latin-script languages can use any of the Latin display choices.
+  const latinChoices = ['Noto Sans', 'Noto Serif', 'Noto Sans Display', 'Noto Sans Mono'];
+  const isScriptLang = ['ar','fa','ur','hi','zh'].includes(l);
+  if (isScriptLang) {
+    // For Arabic-script langs allow the two Arabic faces; else force script font.
+    if (['ar','fa','ur'].includes(l)) {
+      const arabicChoices = ['Noto Sans Arabic', 'Noto Naskh Arabic', 'Noto Kufi Arabic'];
+      return arabicChoices.includes(chosen) ? chosen : scriptFont;
+    }
+    return scriptFont; // hi/zh always use their script font
+  }
+  return latinChoices.includes(chosen) ? chosen : scriptFont;
+}
+
 // Build a styled ASS subtitle file from cues. Social look: big bold text,
 // thick outline, bottom-centred. RTL-aware for fa/ar/ur.
 function buildAss(cues, opts) {
   opts = opts || {};
   const st = opts.style || {};
-  const fontName = st.font || fontForLang(opts.lang);
+  const fontName = pickFont(st.font, opts.lang);
   const fontSize = st.size || 22;
   const primary  = st.primary  || '&H00FFFFFF';  // white   (AABBGGRR)
   const outline  = st.outline  || '&H00000000';  // black
@@ -593,6 +712,8 @@ function buildAss(cues, opts) {
   const shadow   = (st.shadow  != null) ? st.shadow  : 1;
   const marginV  = st.marginV || 40;
   const bold     = st.bold === false ? 0 : -1;
+  // Position: 'top' | 'middle' | 'bottom' (ASS alignment 8 / 5 / 2). Default bottom.
+  const align    = st.align === 'top' ? 8 : st.align === 'middle' ? 5 : 2;
 
   const header =
     '[Script Info]\n' +
@@ -604,7 +725,7 @@ function buildAss(cues, opts) {
     '[V4+ Styles]\n' +
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n' +
     'Style: Default,' + fontName + ',' + fontSize + ',' + primary + ',&H000000FF,' + outline + ',&H64000000,' +
-      bold + ',0,0,0,100,100,0,0,1,' + outlineW + ',' + shadow + ',2,40,40,' + marginV + ',1\n\n' +
+      bold + ',0,0,0,100,100,0,0,1,' + outlineW + ',' + shadow + ',' + align + ',40,40,' + marginV + ',1\n\n' +
     '[Events]\n' +
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
 
@@ -790,6 +911,122 @@ async function freezeFrame(inPath, outPath, at, hold, dir) {
     ffmpeg().input(listFile).inputOptions(['-f', 'concat', '-safe', '0'])
       .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'])
       .output(outPath).on('end', resolve).on('error', e => reject(new Error('freeze concat: ' + e.message))).run();
+  });
+}
+
+// Split-screen: two videos side-by-side or stacked, fit to canvas.
+function splitScreen(leftPath, rightPath, outPath, layout, aspect) {
+  const dims = { '9:16': [1080, 1920], '1:1': [1080, 1080], '16:9': [1920, 1080] }[aspect];
+  const [W, H] = dims;
+  let filter;
+  if (layout === 'stack') {
+    const hw = W, hh = Math.floor(H / 2);
+    filter =
+      `[0:v]scale=${hw}:${hh}:force_original_aspect_ratio=increase,crop=${hw}:${hh},setsar=1[top];` +
+      `[1:v]scale=${hw}:${hh}:force_original_aspect_ratio=increase,crop=${hw}:${hh},setsar=1[bot];` +
+      `[top][bot]vstack=inputs=2[v]`;
+  } else {
+    const hw = Math.floor(W / 2), hh = H;
+    filter =
+      `[0:v]scale=${hw}:${hh}:force_original_aspect_ratio=increase,crop=${hw}:${hh},setsar=1[l];` +
+      `[1:v]scale=${hw}:${hh}:force_original_aspect_ratio=increase,crop=${hw}:${hh},setsar=1[r];` +
+      `[l][r]hstack=inputs=2[v]`;
+  }
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(leftPath).input(rightPath)
+      .complexFilter(filter, 'v')
+      .outputOptions(['-map', '[v]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('splitscreen: ' + e.message))).run();
+  });
+}
+
+// Effects / overlays via ffmpeg filters.
+function applyEffect(inPath, outPath, effect) {
+  const fx = {
+    glow:     'gblur=sigma=8[b];[0:v][b]blend=all_mode=screen:all_opacity=0.35,eq=saturation=1.2:brightness=0.03',
+    sparkle:  'eq=saturation=1.25:contrast=1.1,noise=alls=8:allf=t',
+    vignette: 'vignette=PI/4',
+    vhs:      'curves=r=\'0/0.1 1/0.9\',noise=alls=12:allf=t,eq=saturation=1.3',
+    dream:    'gblur=sigma=4[b];[0:v][b]blend=all_mode=lighten:all_opacity=0.5,eq=saturation=1.15',
+    sharp:    'unsharp=5:5:1.2:5:5:0.6',
+    warm_glow:'eq=saturation=1.2:gamma_r=1.1,vignette=PI/5',
+  };
+  let filter = fx[effect];
+  const isComplex = filter && filter.includes('[b]');
+  return new Promise((resolve, reject) => {
+    const cmd = ffmpeg().input(inPath);
+    if (!filter) { filter = 'null'; }
+    if (isComplex) cmd.complexFilter(filter);
+    else cmd.videoFilters(filter);
+    cmd.outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('effect: ' + e.message))).run();
+  });
+}
+
+// Ken Burns: animate a still with slow zoom/pan. variant 0-3 varies the motion.
+function kenBurns(imgPath, outPath, seconds, dims, variant) {
+  const [W, H] = dims;
+  const fps = 30;
+  const frames = Math.round(seconds * fps);
+  // zoompan zooms from 1.0 → 1.15; pan direction depends on variant.
+  const zEnd = 1.15;
+  const zExpr = `min(zoom+${((zEnd - 1) / frames).toFixed(6)},${zEnd})`;
+  let x = 'iw/2-(iw/zoom/2)', y = 'ih/2-(ih/zoom/2)';       // default: centre zoom-in
+  if (variant === 1) { x = '0'; }                            // pan left→
+  if (variant === 2) { x = 'iw-(iw/zoom)'; }                 // pan right←
+  if (variant === 3) { y = '0'; }                            // pan top↓
+  // scale up first so zoompan has pixels to work with, then zoompan, then fit to canvas
+  const vf =
+    `scale=${W*2}:${H*2}:force_original_aspect_ratio=increase,crop=${W*2}:${H*2},` +
+    `zoompan=z='${zExpr}':x='${x}':y='${y}':d=${frames}:s=${W}x${H}:fps=${fps},` +
+    `format=yuv420p`;
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(imgPath).loop(seconds).inputOptions(['-framerate', String(fps)])
+      .videoFilters(vf)
+      .outputOptions(['-t', String(seconds), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('kenburns: ' + e.message))).run();
+  });
+}
+
+// Simple concat of same-size clips (adds silent audio for consistency).
+function concatClips(clips, outPath, dir) {
+  const listFile = path.join(dir, 'p2v_list.txt');
+  fs.writeFileSync(listFile, clips.map(p => `file '${p}'`).join('\n'));
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(listFile).inputOptions(['-f', 'concat', '-safe', '0'])
+      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('concat: ' + e.message))).run();
+  });
+}
+
+// Join clips with crossfade transitions between each.
+function xfadeJoin(clips, outPath, per, dir) {
+  return new Promise((resolve, reject) => {
+    const cmd = ffmpeg();
+    clips.forEach(c => cmd.input(c));
+    const fadeDur = 0.6;
+    // build chained xfade filter
+    let filter = '', last = '0:v';
+    let offset = per - fadeDur;
+    for (let i = 1; i < clips.length; i++) {
+      const out = (i === clips.length - 1) ? 'vout' : `v${i}`;
+      filter += `[${last}][${i}:v]xfade=transition=fade:duration=${fadeDur}:offset=${offset.toFixed(2)}[${out}];`;
+      last = out;
+      offset += per - fadeDur;
+    }
+    filter = filter.replace(/;$/, '');
+    cmd.complexFilter(filter, 'vout')
+      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('xfade: ' + e.message))).run();
+  });
+}
+
+// Add background music to a (silent) video, trimming music to video length.
+function addBgMusicSimple(videoPath, musicPath, outPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(videoPath).input(musicPath)
+      .outputOptions(['-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart'])
+      .output(outPath).on('end', resolve).on('error', e => reject(new Error('bgmusic: ' + e.message))).run();
   });
 }
 
