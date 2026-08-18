@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       fonts-noto-cjk \
       fonts-noto-extra \
       fonts-noto-color-emoji \
+      fonts-noto-cjk-extra \
  && fc-cache -f \
  && rm -rf /var/lib/apt/lists/*
 
