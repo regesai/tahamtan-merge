@@ -990,6 +990,7 @@ function kenBurns(imgPath, outPath, seconds, dims, variant) {
 
 // Simple concat of same-size clips (adds silent audio for consistency).
 function concatClips(clips, outPath, dir) {
+  if (clips.length === 1) { fs.copyFileSync(clips[0], outPath); return Promise.resolve(); }
   const listFile = path.join(dir, 'p2v_list.txt');
   fs.writeFileSync(listFile, clips.map(p => `file '${p}'`).join('\n'));
   return new Promise((resolve, reject) => {
