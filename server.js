@@ -193,328 +193,6 @@ app.post('/caption', async (req, res) => {
   }
 });
 
-// ─── SPEED (slow-mo / fast, 0.25x–4x) ───────────────────────
-app.post('/speed', async (req, res) => {
-  const { video_url, job_id } = req.body || {};
-  const rate = Math.min(Math.max(parseFloat(req.body && req.body.rate) || 1, 0.25), 4);
-  if (!video_url) return res.status(400).json({ error: 'video_url required' });
-  setJob(job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-spd-'));
-  try {
-    await updateJob(job_id, 'downloading');
-    res.json({ status: 'processing', job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(video_url, inP);
-    await updateJob(job_id, 'processing');
-    await changeSpeed(inP, outP, rate);
-    await updateJob(job_id, 'uploading');
-    await updateJob(job_id, 'done', await uploadOutput(job_id, outP));
-  } catch (e) { await updateJob(job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── SPLIT (keep one part, or remove a middle section) ──────
-// mode 'keep': output [start,end].  mode 'remove': output everything EXCEPT [start,end].
-app.post('/split', async (req, res) => {
-  const { video_url, job_id } = req.body || {};
-  const mode = (req.body && req.body.mode) === 'remove' ? 'remove' : 'keep';
-  const start = Math.max(0, parseFloat(req.body && req.body.start) || 0);
-  const end = parseFloat(req.body && req.body.end);
-  if (!video_url) return res.status(400).json({ error: 'video_url required' });
-  if (!(end > start)) return res.status(400).json({ error: 'end must be greater than start' });
-  setJob(job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-spl-'));
-  try {
-    await updateJob(job_id, 'downloading');
-    res.json({ status: 'processing', job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(video_url, inP);
-    await updateJob(job_id, 'processing');
-    if (mode === 'keep') { await trimClip(inP, outP, start, end); }
-    else { await removeSection(inP, outP, start, end, tmpDir); }
-    await updateJob(job_id, 'uploading');
-    await updateJob(job_id, 'done', await uploadOutput(job_id, outP));
-  } catch (e) { await updateJob(job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── STICKER / EMOJI overlay (burn a large emoji at a position) ──
-// Body: { video_url, job_id, emoji, pos?('tl'|'tr'|'bl'|'br'|'center'), size? }
-app.post('/sticker', async (req, res) => {
-  const b = req.body || {};
-  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
-  if (!b.emoji) return res.status(400).json({ error: 'emoji required' });
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-stk-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(b.video_url, inP);
-    await updateJob(b.job_id, 'processing');
-    await burnSticker(inP, outP, tmpDir, b);
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
-  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── VOLUME (adjust original audio volume, 0–2x; 0 = mute) ──────
-app.post('/volume', async (req, res) => {
-  const b = req.body || {};
-  const vol = Math.min(Math.max(parseFloat(b.volume), 0), 2);
-  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
-  if (isNaN(vol)) return res.status(400).json({ error: 'volume required (0–2)' });
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-vol-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(b.video_url, inP);
-    await updateJob(b.job_id, 'processing');
-    await setVolume(inP, outP, vol);
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
-  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── TEXT overlay (burn a title on screen) ──────────────────
-// Body: { video_url, job_id, text, pos?('top'|'center'|'bottom'), lang?, start?, end? }
-app.post('/text', async (req, res) => {
-  const b = req.body || {};
-  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
-  if (!b.text) return res.status(400).json({ error: 'text required' });
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-txt-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(b.video_url, inP);
-    await updateJob(b.job_id, 'processing');
-    await burnText(inP, outP, tmpDir, b);
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
-  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── FILTER / colour grade (preset or manual) ───────────────
-// Body: { video_url, job_id, preset?, brightness?, contrast?, saturation? }
-app.post('/filter', async (req, res) => {
-  const b = req.body || {};
-  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-flt-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(b.video_url, inP);
-    await updateJob(b.job_id, 'processing');
-    await applyFilter(inP, outP, b);
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
-  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── REFRAME (aspect ratio: 9:16, 1:1, 16:9) ────────────────
-app.post('/reframe', async (req, res) => {
-  const b = req.body || {};
-  const ar = ['9:16', '1:1', '16:9'].includes(b.aspect) ? b.aspect : '9:16';
-  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-rfr-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(b.video_url, inP);
-    await updateJob(b.job_id, 'processing');
-    await reframe(inP, outP, ar);
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
-  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── FADE (fade in + fade out, video + audio) ───────────────
-app.post('/fade', async (req, res) => {
-  const b = req.body || {};
-  const dur = Math.min(Math.max(parseFloat(b.fade) || 1, 0.2), 3);
-  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-fad-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(b.video_url, inP);
-    await updateJob(b.job_id, 'processing');
-    await addFade(inP, outP, dur);
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
-  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── FREEZE (hold a frame for N seconds at time T) ──────────
-app.post('/freeze', async (req, res) => {
-  const b = req.body || {};
-  const at = Math.max(0, parseFloat(b.at) || 0);
-  const hold = Math.min(Math.max(parseFloat(b.hold) || 1.5, 0.3), 5);
-  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-frz-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(b.video_url, inP);
-    await updateJob(b.job_id, 'processing');
-    await freezeFrame(inP, outP, at, hold, tmpDir);
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
-  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── SPLIT-SCREEN / BEFORE-AFTER (two videos side by side or stacked) ──
-// Body: { left_url, right_url, job_id, layout?('side'|'stack'), aspect?('9:16'|'1:1'|'16:9') }
-app.post('/split-screen', async (req, res) => {
-  const b = req.body || {};
-  if (!b.left_url || !b.right_url) return res.status(400).json({ error: 'left_url and right_url required' });
-  const layout = b.layout === 'stack' ? 'stack' : 'side';
-  const aspect = ['9:16', '1:1', '16:9'].includes(b.aspect) ? b.aspect : '9:16';
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-ss-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-    const lp = path.join(tmpDir, 'l.mp4'), rp = path.join(tmpDir, 'r.mp4'), out = path.join(tmpDir, 'out.mp4');
-    await downloadFile(b.left_url, lp);
-    await downloadFile(b.right_url, rp);
-    await updateJob(b.job_id, 'processing');
-    await splitScreen(lp, rp, out, layout, aspect);
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, out));
-  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── EFFECTS / overlays (glow, sparkle, vignette, vhs, etc.) ──
-// Body: { video_url, job_id, effect }
-app.post('/effect', async (req, res) => {
-  const b = req.body || {};
-  if (!b.video_url) return res.status(400).json({ error: 'video_url required' });
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-fx-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-    const inP = path.join(tmpDir, 'in.mp4'), outP = path.join(tmpDir, 'out.mp4');
-    await downloadFile(b.video_url, inP);
-    await updateJob(b.job_id, 'processing');
-    await applyEffect(inP, outP, b.effect);
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, outP));
-  } catch (e) { await updateJob(b.job_id, 'error', null, e.message); }
-  finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── PHOTO → VIDEO (Ken Burns zoom/pan motion on stills) ────
-// Body: { images:[url,...], job_id, perImage?(sec), motion?('zoom'|'pan'|'auto'),
-//         transition?('fade'|'none'), music_url?, aspect?('9:16'|'1:1'|'16:9') }
-app.post('/photo-video', async (req, res) => {
-  const b = req.body || {};
-  const images = Array.isArray(b.images) ? b.images.filter(Boolean) : [];
-  if (!images.length) return res.status(400).json({ error: 'images array required' });
-  const per = Math.min(Math.max(parseFloat(b.perImage) || 3, 1.5), 8);
-  const aspect = ['9:16', '1:1', '16:9'].includes(b.aspect) ? b.aspect : '9:16';
-  const useXfade = (b.transition === 'fade');
-  setJob(b.job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-p2v-'));
-  try {
-    await updateJob(b.job_id, 'downloading');
-    res.json({ status: 'processing', job_id: b.job_id });
-
-    // 1) download all images
-    const localImgs = [];
-    for (let i = 0; i < images.length; i++) {
-      const p = path.join(tmpDir, 'img' + i + path.extname(images[i].split('?')[0]) || '.jpg');
-      await downloadFile(images[i], p);
-      localImgs.push(p);
-    }
-
-    await updateJob(b.job_id, 'processing');
-    const dims = { '9:16': [1080, 1920], '1:1': [1080, 1080], '16:9': [1920, 1080] }[aspect];
-    const clips = [];
-    // 2) make a Ken Burns clip per image
-    for (let i = 0; i < localImgs.length; i++) {
-      const out = path.join(tmpDir, 'clip' + i + '.mp4');
-      await kenBurns(localImgs[i], out, per, dims, i % 4);
-      clips.push(out);
-    }
-
-    // 3) join (with or without crossfade), then optional music
-    const joined = path.join(tmpDir, 'joined.mp4');
-    if (useXfade && clips.length > 1) await xfadeJoin(clips, joined, per, tmpDir);
-    else await concatClips(clips, joined, tmpDir);
-
-    let finalOut = joined;
-    if (b.music_url) {
-      const mp = path.join(tmpDir, 'music.mp3');
-      await downloadFile(b.music_url, mp);
-      finalOut = path.join(tmpDir, 'final.mp4');
-      await addBgMusicSimple(joined, mp, finalOut);
-    }
-
-    await updateJob(b.job_id, 'uploading');
-    await updateJob(b.job_id, 'done', await uploadOutput(b.job_id, finalOut));
-  } catch (e) {
-    console.error('[' + b.job_id + '] photo-video error:', e.message);
-    await updateJob(b.job_id, 'error', null, e.message);
-  } finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(x){} }
-});
-
-// ─── TRIM (cut a start/end range from a video) ──────────────
-// Body: { video_url, job_id, start, end }  (start/end in seconds)
-app.post('/trim', async (req, res) => {
-  const { video_url, job_id } = req.body || {};
-  const start = Math.max(0, parseFloat(req.body && req.body.start) || 0);
-  const end = parseFloat(req.body && req.body.end);
-  if (!video_url) return res.status(400).json({ error: 'video_url required' });
-  if (!(end > start)) return res.status(400).json({ error: 'end must be greater than start' });
-  console.log(`[${job_id}] Trim job started — ${start}s to ${end}s`);
-  setJob(job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-trim-'));
-
-  try {
-    await updateJob(job_id, 'downloading');
-    res.json({ status: 'processing', job_id, message: 'Trim started' });
-
-    const inPath = path.join(tmpDir, 'in.mp4');
-    await downloadFile(video_url, inPath);
-
-    await updateJob(job_id, 'trimming');
-    const outPath = path.join(tmpDir, 'out.mp4');
-    await trimClip(inPath, outPath, start, end);
-
-    await updateJob(job_id, 'uploading');
-    const publicUrl = await uploadOutput(job_id, outPath);
-    await updateJob(job_id, 'done', publicUrl);
-    console.log(`[${job_id}] Trim done — ${publicUrl}`);
-  } catch (err) {
-    console.error(`[${job_id}] Trim error:`, err.message);
-    await updateJob(job_id, 'error', null, err.message);
-  } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
-  }
-});
-
 // ─── FINALIZE (optimize for social platforms) ───────────────
 // Body: { video_url, job_id, boost? }
 // Re-wraps the video as a clean 1080x1920 H.264/AAC file with BT.709
@@ -590,6 +268,301 @@ app.post('/music', async (req, res) => {
     await updateJob(job_id, 'error', null, err.message);
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// EDIT-TAB ENDPOINTS
+// Each mirrors the /caption pattern: respond 'processing' immediately,
+// run ffmpeg async, then updateJob(...,'done',url). Browser polls
+// /status/:job_id and reads .url. All re-encode with libx264/yuv420p
+// so the result plays everywhere and can be chained tool→tool.
+// ═══════════════════════════════════════════════════════════════
+
+// Generic single-input job runner. `runner(inPath,outPath,body)` does the ffmpeg.
+async function runVideoJob(req, res, tag, runner) {
+  const body = req.body || {};
+  const { video_url, job_id } = body;
+  if (!video_url) return res.status(400).json({ error: 'video_url required' });
+  console.log(`[${job_id}] ${tag} job started`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-' + tag + '-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: tag + ' started' });
+    const inPath = path.join(tmpDir, 'in.mp4');
+    await downloadFile(video_url, inPath);
+    await updateJob(job_id, tag);
+    const outPath = path.join(tmpDir, 'out.mp4');
+    await runner(inPath, outPath, body, tmpDir);
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] ${tag} done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] ${tag} error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+// Run ffmpeg with either a videoFilters string (vf) or a complexFilter (complex+maps).
+// Copies/encodes audio sensibly. Used by most edit runners.
+function runFF(inPath, outPath, opts) {
+  opts = opts || {};
+  return new Promise((resolve, reject) => {
+    const cmd = ffmpeg().input(inPath);
+    const out = [
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '20',
+      '-movflags', '+faststart'
+    ];
+    if (opts.complex) {
+      cmd.complexFilter(opts.complex, opts.maps || undefined);
+    } else if (opts.vf) {
+      cmd.videoFilters(opts.vf);
+    }
+    // Audio handling: 'copy' (default), 'encode', 'drop', or a filter via opts.af
+    if (opts.audio === 'drop') { out.push('-an'); }
+    else if (opts.af) { cmd.audioFilters(opts.af); out.push('-c:a', 'aac', '-b:a', '192k'); }
+    else if (opts.audio === 'encode') { out.push('-c:a', 'aac', '-b:a', '192k'); }
+    else { out.push('-c:a', 'copy'); }
+    if (opts.extraOut) opts.extraOut.forEach(o => out.push(o));
+    cmd.outputOptions(out)
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', (err) => reject(new Error(opts.tag ? (opts.tag + ' ffmpeg error: ' + err.message) : err.message)))
+      .run();
+  });
+}
+
+// ─── TRIM ─── { start, end } seconds
+app.post('/trim', (req, res) => runVideoJob(req, res, 'trim', async (inPath, outPath, b) => {
+  const start = Math.max(0, parseFloat(b.start) || 0);
+  const end = parseFloat(b.end) || 0;
+  const dur = Math.max(0.1, end - start);
+  await new Promise((resolve, reject) => {
+    ffmpeg().input(inPath).setStartTime(start).duration(dur)
+      .outputOptions(['-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-c:a aac', '-b:a 192k', '-movflags +faststart'])
+      .output(outPath).on('end', resolve)
+      .on('error', (e) => reject(new Error('trim ffmpeg error: ' + e.message))).run();
+  });
+}));
+
+// ─── SPEED ─── { rate }  0.25..4  (video setpts + audio atempo, chained)
+app.post('/speed', (req, res) => runVideoJob(req, res, 'speed', async (inPath, outPath, b) => {
+  let rate = parseFloat(b.rate) || 1;
+  rate = Math.min(Math.max(rate, 0.25), 4);
+  const probe = await probeClip(inPath);
+  const vpts = (1 / rate).toFixed(5);
+  // atempo only accepts 0.5..2.0 — chain factors to reach the target rate.
+  function atempoChain(r) {
+    const parts = []; let x = r;
+    while (x > 2.0) { parts.push('atempo=2.0'); x /= 2.0; }
+    while (x < 0.5) { parts.push('atempo=0.5'); x /= 0.5; }
+    parts.push('atempo=' + x.toFixed(5));
+    return parts.join(',');
+  }
+  if (probe.hasAudio) {
+    await runFF(inPath, outPath, {
+      complex: `[0:v]setpts=${vpts}*PTS[v];[0:a]${atempoChain(rate)}[a]`,
+      maps: ['v', 'a'], audio: 'encode', tag: 'speed'
+    });
+  } else {
+    await runFF(inPath, outPath, { vf: `setpts=${vpts}*PTS`, audio: 'drop', tag: 'speed' });
+  }
+}));
+
+// ─── VOLUME ─── { volume }  0..3  (1 = unchanged)
+app.post('/volume', (req, res) => runVideoJob(req, res, 'volume', async (inPath, outPath, b) => {
+  const vol = Math.min(Math.max(parseFloat(b.volume), 0), 3);
+  const probe = await probeClip(inPath);
+  if (!probe.hasAudio) { await runFF(inPath, outPath, { audio: 'drop', tag: 'volume' }); return; }
+  await runFF(inPath, outPath, { af: 'volume=' + (isNaN(vol) ? 1 : vol), tag: 'volume' });
+}));
+
+// ─── FILTER ─── { preset }  vivid|warm|cool|cinema|bw|bright
+app.post('/filter', (req, res) => runVideoJob(req, res, 'filter', async (inPath, outPath, b) => {
+  const p = String(b.preset || '').toLowerCase();
+  const map = {
+    vivid:  'eq=saturation=1.45:contrast=1.12:brightness=0.02',
+    warm:   "curves=r='0/0.06 1/1':b='0/0 1/0.94',eq=saturation=1.1",
+    cool:   "curves=b='0/0.06 1/1':r='0/0 1/0.94',eq=saturation=1.05",
+    cinema: "eq=contrast=1.12:saturation=0.92,curves=r='0/0.03 0.5/0.5 1/0.97':b='0/0.04 0.5/0.5 1/0.95'",
+    bw:     'hue=s=0,eq=contrast=1.1',
+    bright: 'eq=brightness=0.09:saturation=1.06:contrast=1.03'
+  };
+  const vf = map[p] || map.vivid;
+  await runFF(inPath, outPath, { vf, tag: 'filter' });
+}));
+
+// ─── EFFECT ─── { effect }  glow|sparkle|dream|vhs|vignette|warm_glow
+app.post('/effect', (req, res) => runVideoJob(req, res, 'effect', async (inPath, outPath, b) => {
+  const e = String(b.effect || '').toLowerCase();
+  // Bloom-style effects use a screen blend of a blurred copy over the original.
+  const bloom = (sigma, op, pre) =>
+    ({ complex: `[0:v]${pre || 'null'}[base];[base]split[a][b];[b]gblur=sigma=${sigma}[bl];[a][bl]blend=all_mode=screen:all_opacity=${op}[v]`, maps: ['v'] });
+  let opts;
+  switch (e) {
+    case 'glow':      opts = bloom(9, 0.35, 'eq=brightness=0.03:saturation=1.05'); break;
+    case 'warm_glow': opts = bloom(9, 0.35, "curves=r='0/0.06 1/1':b='0/0 1/0.94',eq=saturation=1.08"); break;
+    case 'dream':     opts = bloom(4, 0.45, 'eq=saturation=1.1:brightness=0.03'); break;
+    case 'sparkle':   opts = bloom(6, 0.3,  'eq=brightness=0.05:saturation=1.15:contrast=1.05'); break;
+    case 'vhs':       opts = { vf: "noise=c0s=26:allf=t,eq=saturation=1.25:contrast=1.05,curves=r='0/0.03 1/1'" }; break;
+    case 'vignette':  opts = { vf: 'vignette=PI/4' }; break;
+    default:          opts = bloom(9, 0.35, 'eq=brightness=0.03:saturation=1.05');
+  }
+  opts.tag = 'effect';
+  await runFF(inPath, outPath, opts);
+}));
+
+// ─── REFRAME ─── { aspect }  9:16 | 1:1 | 16:9  (scale+pad, no crop/distort)
+app.post('/reframe', (req, res) => runVideoJob(req, res, 'reframe', async (inPath, outPath, b) => {
+  const dims = aspectDims(b.aspect);
+  const vf = `scale=${dims.w}:${dims.h}:force_original_aspect_ratio=decrease,` +
+             `pad=${dims.w}:${dims.h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p`;
+  await runFF(inPath, outPath, { vf, tag: 'reframe' });
+}));
+
+// ─── FADE ─── { fade }  seconds of fade in + fade out
+app.post('/fade', (req, res) => runVideoJob(req, res, 'fade', async (inPath, outPath, b) => {
+  const f = Math.min(Math.max(parseFloat(b.fade) || 1, 0.2), 5);
+  const probe = await probeClip(inPath);
+  const dur = probe.duration || 0;
+  const outSt = Math.max(0, dur - f).toFixed(2);
+  const vf = `fade=t=in:st=0:d=${f},fade=t=out:st=${outSt}:d=${f}`;
+  if (probe.hasAudio && dur) {
+    await runFF(inPath, outPath, {
+      complex: `[0:v]${vf}[v];[0:a]afade=t=in:st=0:d=${f},afade=t=out:st=${outSt}:d=${f}[a]`,
+      maps: ['v', 'a'], audio: 'encode', tag: 'fade'
+    });
+  } else {
+    await runFF(inPath, outPath, { vf, audio: probe.hasAudio ? 'copy' : 'drop', tag: 'fade' });
+  }
+}));
+
+// ─── TEXT ─── { text, pos(top|center|bottom), lang }  burn a title over the whole clip
+app.post('/text', (req, res) => runVideoJob(req, res, 'text', async (inPath, outPath, b, tmpDir) => {
+  const text = String(b.text || '').trim();
+  if (!text) throw new Error('text required');
+  const probe = await probeClip(inPath);
+  const dur = probe.duration || 5;
+  const assPath = path.join(tmpDir, 'text.ass');
+  fs.writeFileSync(assPath, buildTitleAss(text, {
+    pos: b.pos || 'bottom', lang: b.lang || '', dur: dur,
+    rtl: /^(fa|ar|ur)$/i.test(String(b.lang || ''))
+  }));
+  await burnSubtitles(inPath, assPath, outPath, tmpDir);
+}));
+
+// ─── STICKER ─── { emoji, pos(br|bl|tr|tl|center), size }  overlay an emoji
+app.post('/sticker', (req, res) => runVideoJob(req, res, 'sticker', async (inPath, outPath, b, tmpDir) => {
+  const emoji = String(b.emoji || '🔥');
+  const size = Math.min(Math.max(parseInt(b.size, 10) || 160, 40), 400);
+  const pos = String(b.pos || 'br');
+  const M = 40; // margin from edges
+  const posMap = {
+    br: `x=w-tw-${M}:y=h-th-${M}`, bl: `x=${M}:y=h-th-${M}`,
+    tr: `x=w-tw-${M}:y=${M}`,       tl: `x=${M}:y=${M}`,
+    center: 'x=(w-tw)/2:y=(h-th)/2'
+  };
+  const xy = posMap[pos] || posMap.br;
+  const fontFile = process.env.EMOJI_FONT || '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf';
+  // Write emoji to a textfile so unicode survives the filter graph.
+  const txtPath = path.join(tmpDir, 'sticker.txt');
+  fs.writeFileSync(txtPath, emoji, 'utf8');
+  const esc = txtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+  const fesc = fontFile.replace(/\\/g, '/').replace(/:/g, '\\:');
+  const vf = `drawtext=fontfile='${fesc}':textfile='${esc}':fontsize=${size}:${xy}`;
+  await runFF(inPath, outPath, { vf, tag: 'sticker' });
+}));
+
+// ─── FREEZE ─── { at, hold }  hold the frame at `at` for `hold` seconds
+app.post('/freeze', (req, res) => runVideoJob(req, res, 'freeze', async (inPath, outPath, b, tmpDir) => {
+  const at = Math.max(0, parseFloat(b.at) || 0);
+  const hold = Math.min(Math.max(parseFloat(b.hold) || 1.5, 0.3), 10);
+  await freezeFrame(inPath, outPath, at, hold, tmpDir);
+}));
+
+// ─── PHOTO-VIDEO ─── { images:[], aspect, transition, perImage }  Ken Burns slideshow
+app.post('/photo-video', async (req, res) => {
+  const b = req.body || {};
+  const images = b.images;
+  const job_id = b.job_id;
+  if (!Array.isArray(images) || images.length === 0) {
+    return res.status(400).json({ error: 'images[] required' });
+  }
+  console.log(`[${job_id}] photo-video — ${images.length} images`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-p2v-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'photo-video started' });
+    const dims = aspectDims(b.aspect);
+    const per = Math.min(Math.max(parseFloat(b.perImage) || 3, 1.5), 8);
+    const clips = [];
+    for (let i = 0; i < images.length && i < 8; i++) {
+      const img = path.join(tmpDir, `img_${i}` + (String(images[i]).match(/\.(png|webp|jpe?g)(\?|$)/i) ? '.' + RegExp.$1 : '.jpg'));
+      await downloadFile(images[i], img);
+      const clip = path.join(tmpDir, `clip_${i}.mp4`);
+      await kenBurnsClip(img, clip, per, dims, i);
+      clips.push(clip);
+    }
+    await updateJob(job_id, 'building');
+    const outPath = path.join(tmpDir, 'out.mp4');
+    if (clips.length === 1) {
+      fs.copyFileSync(clips[0], outPath);
+    } else if (String(b.transition) === 'fade') {
+      try { await mergeVideosSmooth(clips, outPath); }
+      catch (e) {
+        const listFile = path.join(tmpDir, 'list.txt');
+        fs.writeFileSync(listFile, clips.map(f => `file '${f}'`).join('\n'));
+        await mergeVideos(listFile, outPath);
+      }
+    } else {
+      const listFile = path.join(tmpDir, 'list.txt');
+      fs.writeFileSync(listFile, clips.map(f => `file '${f}'`).join('\n'));
+      await mergeVideos(listFile, outPath);
+    }
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] photo-video done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] photo-video error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+// ─── SPLIT-SCREEN ─── { left_url, right_url, layout(side|stack), aspect }
+app.post('/split-screen', async (req, res) => {
+  const b = req.body || {};
+  const { left_url, right_url, job_id } = b;
+  if (!left_url || !right_url) return res.status(400).json({ error: 'left_url and right_url required' });
+  console.log(`[${job_id}] split-screen — ${b.layout || 'side'}`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-ss-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'split-screen started' });
+    const lPath = path.join(tmpDir, 'left.mp4');
+    const rPath = path.join(tmpDir, 'right.mp4');
+    await downloadFile(left_url, lPath);
+    await downloadFile(right_url, rPath);
+    await updateJob(job_id, 'building');
+    const outPath = path.join(tmpDir, 'out.mp4');
+    await splitScreen(lPath, rPath, outPath, b.layout || 'side', b.aspect || '9:16');
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] split-screen done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] split-screen error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
   }
 });
 
@@ -678,33 +651,12 @@ function fontForLang(lang) {
   }
 }
 
-// Pick the caption font: honor the user's choice ONLY if it can render the
-// language's script; otherwise fall back to the correct script font so
-// Persian/Arabic/etc. never break.
-function pickFont(chosen, lang) {
-  const l = String(lang || '').toLowerCase();
-  const scriptFont = fontForLang(l);
-  if (!chosen) return scriptFont;
-  // Latin-script languages can use any of the Latin display choices.
-  const latinChoices = ['Noto Sans', 'Noto Serif', 'Noto Sans Display', 'Noto Sans Mono'];
-  const isScriptLang = ['ar','fa','ur','hi','zh'].includes(l);
-  if (isScriptLang) {
-    // For Arabic-script langs allow the two Arabic faces; else force script font.
-    if (['ar','fa','ur'].includes(l)) {
-      const arabicChoices = ['Noto Sans Arabic', 'Noto Naskh Arabic', 'Noto Kufi Arabic'];
-      return arabicChoices.includes(chosen) ? chosen : scriptFont;
-    }
-    return scriptFont; // hi/zh always use their script font
-  }
-  return latinChoices.includes(chosen) ? chosen : scriptFont;
-}
-
 // Build a styled ASS subtitle file from cues. Social look: big bold text,
 // thick outline, bottom-centred. RTL-aware for fa/ar/ur.
 function buildAss(cues, opts) {
   opts = opts || {};
   const st = opts.style || {};
-  const fontName = pickFont(st.font, opts.lang);
+  const fontName = st.font || fontForLang(opts.lang);
   const fontSize = st.size || 22;
   const primary  = st.primary  || '&H00FFFFFF';  // white   (AABBGGRR)
   const outline  = st.outline  || '&H00000000';  // black
@@ -712,8 +664,6 @@ function buildAss(cues, opts) {
   const shadow   = (st.shadow  != null) ? st.shadow  : 1;
   const marginV  = st.marginV || 40;
   const bold     = st.bold === false ? 0 : -1;
-  // Position: 'top' | 'middle' | 'bottom' (ASS alignment 8 / 5 / 2). Default bottom.
-  const align    = st.align === 'top' ? 8 : st.align === 'middle' ? 5 : 2;
 
   const header =
     '[Script Info]\n' +
@@ -725,7 +675,7 @@ function buildAss(cues, opts) {
     '[V4+ Styles]\n' +
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n' +
     'Style: Default,' + fontName + ',' + fontSize + ',' + primary + ',&H000000FF,' + outline + ',&H64000000,' +
-      bold + ',0,0,0,100,100,0,0,1,' + outlineW + ',' + shadow + ',' + align + ',40,40,' + marginV + ',1\n\n' +
+      bold + ',0,0,0,100,100,0,0,1,' + outlineW + ',' + shadow + ',2,40,40,' + marginV + ',1\n\n' +
     '[Events]\n' +
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
 
@@ -750,308 +700,6 @@ function buildAss(cues, opts) {
 //  - ~12 Mbps target so the platform transcoder gets a clean source
 //  - light brightness + shadow lift + saturation so it survives the crush
 //  - 30fps, AAC 192k, +faststart
-// Change playback speed (video setpts + audio atempo, chained for range).
-function changeSpeed(inPath, outPath, rate) {
-  // atempo supports 0.5–2.0 per filter; chain for wider range.
-  let a = [], r = rate;
-  while (r > 2.0) { a.push('atempo=2.0'); r /= 2.0; }
-  while (r < 0.5) { a.push('atempo=0.5'); r /= 0.5; }
-  a.push('atempo=' + r.toFixed(4));
-  const vpts = (1 / rate).toFixed(4);
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(inPath)
-      .complexFilter([`[0:v]setpts=${vpts}*PTS[v]`, `[0:a]${a.join(',')}[a]`])
-      .outputOptions(['-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('speed: ' + e.message))).run();
-  });
-}
-
-// Remove the [start,end] section: cut the two surrounding parts and concat.
-async function removeSection(inPath, outPath, start, end, dir) {
-  const probe = await probeClip(inPath);
-  const total = probe.duration || 0;
-  const partA = path.join(dir, 'a.mp4'), partB = path.join(dir, 'b.mp4');
-  const jobs = [];
-  if (start > 0.05) jobs.push(trimClip(inPath, partA, 0, start).then(() => partA));
-  if (end < total - 0.05) jobs.push(trimClip(inPath, partB, end, total).then(() => partB));
-  const parts = await Promise.all(jobs);
-  if (parts.length === 1) { fs.copyFileSync(parts[0], outPath); return; }
-  const listFile = path.join(dir, 'list.txt');
-  fs.writeFileSync(listFile, parts.map(p => `file '${p}'`).join('\n'));
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(listFile).inputOptions(['-f', 'concat', '-safe', '0'])
-      .outputOptions(['-c', 'copy', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('split: ' + e.message))).run();
-  });
-}
-
-// Burn a big emoji/sticker at a corner or center using drawtext (color emoji font).
-function burnSticker(inPath, outPath, dir, b) {
-  const size = Math.min(Math.max(parseInt(b.size) || 160, 48), 400);
-  const m = 40; // margin from edges
-  const posMap = {
-    tl: `x=${m}:y=${m}`,
-    tr: `x=w-tw-${m}:y=${m}`,
-    bl: `x=${m}:y=h-th-${m}`,
-    br: `x=w-tw-${m}:y=h-th-${m}`,
-    center: `x=(w-tw)/2:y=(h-th)/2`,
-  };
-  const pos = posMap[b.pos] || posMap.br;
-  // write emoji to a text file to avoid shell-escaping issues
-  const txtFile = path.join(dir, 'emoji.txt');
-  fs.writeFileSync(txtFile, String(b.emoji));
-  const vf = `drawtext=fontfile=/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf:textfile='${txtFile}':fontsize=${size}:${pos}`;
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(inPath).videoFilters(vf)
-      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('sticker: ' + e.message))).run();
-  });
-}
-
-// Adjust original audio volume (0 mutes, 1 unchanged, 2 = 2x).
-function setVolume(inPath, outPath, vol) {
-  return new Promise((resolve, reject) => {
-    const cmd = ffmpeg().input(inPath);
-    if (vol === 0) {
-      cmd.outputOptions(['-an', '-c:v', 'copy', '-movflags', '+faststart']);
-    } else {
-      cmd.audioFilters(`volume=${vol}`)
-        .outputOptions(['-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart']);
-    }
-    cmd.output(outPath).on('end', resolve).on('error', e => reject(new Error('volume: ' + e.message))).run();
-  });
-}
-
-// Burn a single styled text/title using an ASS file (reuses buildAss styling).
-function burnText(inPath, outPath, dir, b) {
-  const pos = b.pos === 'top' ? 8 : b.pos === 'center' ? 5 : 2;   // ASS alignment
-  const dur = (b.end != null && b.start != null) ? null : null;
-  const start = b.start != null ? Number(b.start) : 0;
-  const probeEnd = b.end != null ? Number(b.end) : 999;
-  const rtl = ['ar', 'fa', 'ur'].includes(String(b.lang || '').toLowerCase());
-  const cues = [{ start: start, end: probeEnd, text: String(b.text) }];
-  const ass = buildAss(cues, { rtl: rtl, lang: b.lang || '', style: { size: 32, marginV: pos === 5 ? 0 : 60 } });
-  // force alignment
-  const ass2 = ass.replace(/,2,40,40,\d+,1/, `,${pos},40,40,${pos === 5 ? 0 : 60},1`);
-  const assPath = path.join(dir, 't.ass');
-  fs.writeFileSync(assPath, ass2);
-  return burnSubtitles(inPath, assPath, outPath, dir);
-}
-
-// Colour grade: presets or manual eq values.
-function applyFilter(inPath, outPath, b) {
-  const presets = {
-    vivid:   'eq=saturation=1.4:contrast=1.15:brightness=0.03',
-    warm:    'eq=saturation=1.15:gamma_r=1.08:gamma_b=0.95',
-    cool:    'eq=saturation=1.1:gamma_b=1.08:gamma_r=0.95',
-    bw:      'hue=s=0,eq=contrast=1.15',
-    cinema:  'curves=all=\'0/0.05 0.5/0.5 1/0.95\',eq=saturation=1.05:contrast=1.1',
-    bright:  'eq=brightness=0.08:saturation=1.1',
-  };
-  let vf = presets[b.preset];
-  if (!vf) {
-    const br = (parseFloat(b.brightness) || 0);
-    const co = (parseFloat(b.contrast) || 1);
-    const sa = (parseFloat(b.saturation) || 1);
-    vf = `eq=brightness=${br}:contrast=${co}:saturation=${sa}`;
-  }
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(inPath).videoFilters(vf)
-      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('filter: ' + e.message))).run();
-  });
-}
-
-// Reframe to an aspect ratio (fit + black pad, no distortion).
-function reframe(inPath, outPath, aspect) {
-  const dims = { '9:16': [1080, 1920], '1:1': [1080, 1080], '16:9': [1920, 1080] }[aspect];
-  const [w, h] = dims;
-  const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(inPath).videoFilters(vf)
-      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('reframe: ' + e.message))).run();
-  });
-}
-
-// Fade in + fade out on video and audio.
-async function addFade(inPath, outPath, d) {
-  const probe = await probeClip(inPath);
-  const total = probe.duration || 0;
-  const outStart = Math.max(0, total - d).toFixed(2);
-  const vf = `fade=t=in:st=0:d=${d},fade=t=out:st=${outStart}:d=${d}`;
-  const af = `afade=t=in:st=0:d=${d},afade=t=out:st=${outStart}:d=${d}`;
-  return new Promise((resolve, reject) => {
-    const cmd = ffmpeg().input(inPath).videoFilters(vf);
-    if (probe.hasAudio) cmd.audioFilters(af);
-    cmd.outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('fade: ' + e.message))).run();
-  });
-}
-
-// Freeze a frame at time `at` for `hold` seconds (split, still, concat).
-async function freezeFrame(inPath, outPath, at, hold, dir) {
-  const probe = await probeClip(inPath);
-  const total = probe.duration || 0;
-  const before = path.join(dir, 'bf.mp4'), still = path.join(dir, 'st.mp4'), after = path.join(dir, 'af.mp4');
-  const png = path.join(dir, 'frame.png');
-  // grab the frame
-  await new Promise((res, rej) => ffmpeg().input(inPath).seekInput(at).frames(1).output(png).on('end', res).on('error', e => rej(new Error('freeze grab: ' + e.message))).run());
-  // make a still clip of `hold` secs (silent)
-  await new Promise((res, rej) => ffmpeg().input(png).loop(hold).inputOptions(['-framerate', '30'])
-    .outputOptions(['-t', String(hold), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2'])
-    .output(still).on('end', res).on('error', e => rej(new Error('freeze still: ' + e.message))).run());
-  const parts = [];
-  await trimClip(inPath, before, 0, at); parts.push(before);
-  parts.push(still);
-  if (at < total - 0.05) { await trimClip(inPath, after, at, total); parts.push(after); }
-  const listFile = path.join(dir, 'fl.txt');
-  fs.writeFileSync(listFile, parts.map(p => `file '${p}'`).join('\n'));
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(listFile).inputOptions(['-f', 'concat', '-safe', '0'])
-      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('freeze concat: ' + e.message))).run();
-  });
-}
-
-// Split-screen: two videos side-by-side or stacked, fit to canvas.
-function splitScreen(leftPath, rightPath, outPath, layout, aspect) {
-  const dims = { '9:16': [1080, 1920], '1:1': [1080, 1080], '16:9': [1920, 1080] }[aspect];
-  const [W, H] = dims;
-  let filter;
-  if (layout === 'stack') {
-    const hw = W, hh = Math.floor(H / 2);
-    filter =
-      `[0:v]scale=${hw}:${hh}:force_original_aspect_ratio=increase,crop=${hw}:${hh},setsar=1[top];` +
-      `[1:v]scale=${hw}:${hh}:force_original_aspect_ratio=increase,crop=${hw}:${hh},setsar=1[bot];` +
-      `[top][bot]vstack=inputs=2[v]`;
-  } else {
-    const hw = Math.floor(W / 2), hh = H;
-    filter =
-      `[0:v]scale=${hw}:${hh}:force_original_aspect_ratio=increase,crop=${hw}:${hh},setsar=1[l];` +
-      `[1:v]scale=${hw}:${hh}:force_original_aspect_ratio=increase,crop=${hw}:${hh},setsar=1[r];` +
-      `[l][r]hstack=inputs=2[v]`;
-  }
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(leftPath).input(rightPath)
-      .complexFilter(filter, 'v')
-      .outputOptions(['-map', '[v]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('splitscreen: ' + e.message))).run();
-  });
-}
-
-// Effects / overlays via ffmpeg filters.
-function applyEffect(inPath, outPath, effect) {
-  const fx = {
-    glow:     'gblur=sigma=8[b];[0:v][b]blend=all_mode=screen:all_opacity=0.35,eq=saturation=1.2:brightness=0.03',
-    sparkle:  'eq=saturation=1.25:contrast=1.1,noise=alls=8:allf=t',
-    vignette: 'vignette=PI/4',
-    vhs:      'curves=r=\'0/0.1 1/0.9\',noise=alls=12:allf=t,eq=saturation=1.3',
-    dream:    'gblur=sigma=4[b];[0:v][b]blend=all_mode=lighten:all_opacity=0.5,eq=saturation=1.15',
-    sharp:    'unsharp=5:5:1.2:5:5:0.6',
-    warm_glow:'eq=saturation=1.2:gamma_r=1.1,vignette=PI/5',
-  };
-  let filter = fx[effect];
-  const isComplex = filter && filter.includes('[b]');
-  return new Promise((resolve, reject) => {
-    const cmd = ffmpeg().input(inPath);
-    if (!filter) { filter = 'null'; }
-    if (isComplex) cmd.complexFilter(filter);
-    else cmd.videoFilters(filter);
-    cmd.outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('effect: ' + e.message))).run();
-  });
-}
-
-// Ken Burns: animate a still with slow zoom/pan. variant 0-3 varies the motion.
-function kenBurns(imgPath, outPath, seconds, dims, variant) {
-  const [W, H] = dims;
-  const fps = 30;
-  const frames = Math.round(seconds * fps);
-  // zoompan zooms from 1.0 → 1.15; pan direction depends on variant.
-  const zEnd = 1.15;
-  const zExpr = `min(zoom+${((zEnd - 1) / frames).toFixed(6)},${zEnd})`;
-  let x = 'iw/2-(iw/zoom/2)', y = 'ih/2-(ih/zoom/2)';       // default: centre zoom-in
-  if (variant === 1) { x = '0'; }                            // pan left→
-  if (variant === 2) { x = 'iw-(iw/zoom)'; }                 // pan right←
-  if (variant === 3) { y = '0'; }                            // pan top↓
-  // scale up first so zoompan has pixels to work with, then zoompan, then fit to canvas
-  const vf =
-    `scale=${W*2}:${H*2}:force_original_aspect_ratio=increase,crop=${W*2}:${H*2},` +
-    `zoompan=z='${zExpr}':x='${x}':y='${y}':d=${frames}:s=${W}x${H}:fps=${fps},` +
-    `format=yuv420p`;
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(imgPath).loop(seconds).inputOptions(['-framerate', String(fps)])
-      .videoFilters(vf)
-      .outputOptions(['-t', String(seconds), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('kenburns: ' + e.message))).run();
-  });
-}
-
-// Simple concat of same-size clips (adds silent audio for consistency).
-function concatClips(clips, outPath, dir) {
-  if (clips.length === 1) { fs.copyFileSync(clips[0], outPath); return Promise.resolve(); }
-  const listFile = path.join(dir, 'p2v_list.txt');
-  fs.writeFileSync(listFile, clips.map(p => `file '${p}'`).join('\n'));
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(listFile).inputOptions(['-f', 'concat', '-safe', '0'])
-      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('concat: ' + e.message))).run();
-  });
-}
-
-// Join clips with crossfade transitions between each.
-function xfadeJoin(clips, outPath, per, dir) {
-  return new Promise((resolve, reject) => {
-    const cmd = ffmpeg();
-    clips.forEach(c => cmd.input(c));
-    const fadeDur = 0.6;
-    // build chained xfade filter
-    let filter = '', last = '0:v';
-    let offset = per - fadeDur;
-    for (let i = 1; i < clips.length; i++) {
-      const out = (i === clips.length - 1) ? 'vout' : `v${i}`;
-      filter += `[${last}][${i}:v]xfade=transition=fade:duration=${fadeDur}:offset=${offset.toFixed(2)}[${out}];`;
-      last = out;
-      offset += per - fadeDur;
-    }
-    filter = filter.replace(/;$/, '');
-    cmd.complexFilter(filter, 'vout')
-      .outputOptions(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('xfade: ' + e.message))).run();
-  });
-}
-
-// Add background music to a (silent) video, trimming music to video length.
-function addBgMusicSimple(videoPath, musicPath, outPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg().input(videoPath).input(musicPath)
-      .outputOptions(['-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart'])
-      .output(outPath).on('end', resolve).on('error', e => reject(new Error('bgmusic: ' + e.message))).run();
-  });
-}
-
-// Cut [start, end] (seconds) from a video. Re-encodes for frame-accurate cuts.
-function trimClip(inPath, outPath, start, end) {
-  const dur = Math.max(0.1, end - start);
-  return new Promise((resolve, reject) => {
-    ffmpeg()
-      .input(inPath)
-      .setStartTime(start)
-      .duration(dur)
-      .outputOptions([
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '192k',
-        '-movflags', '+faststart'
-      ])
-      .output(outPath)
-      .on('end', resolve)
-      .on('error', (err) => reject(new Error('trim ffmpeg error: ' + err.message)))
-      .run();
-  });
-}
-
 function finalizeForSocial(inPath, outPath, opts) {
   opts = opts || {};
   const boost = opts.boost !== false;
@@ -1300,6 +948,148 @@ async function updateJob(job_id, status, video_url = null, error = null) {
   } catch(e) {
     console.warn('Supabase update skipped:', e.message);
   }
+}
+
+// ─── EDIT-TAB HELPERS ────────────────────────────────────────
+
+// Target pixel dims for an aspect ratio label.
+function aspectDims(aspect) {
+  switch (String(aspect || '9:16')) {
+    case '1:1':  return { w: 1080, h: 1080 };
+    case '16:9': return { w: 1920, h: 1080 };
+    case '9:16':
+    default:     return { w: 1080, h: 1920 };
+  }
+}
+
+// Build a single-cue ASS that shows `text` for the whole clip, positioned
+// top / center / bottom. RTL-aware. Reuses the burnSubtitles pipeline.
+function buildTitleAss(text, opts) {
+  opts = opts || {};
+  const dur = Math.max(0.5, opts.dur || 5);
+  const align = opts.pos === 'top' ? 8 : (opts.pos === 'center' ? 5 : 2);
+  const marginV = opts.pos === 'center' ? 0 : 70;
+  const fontName = fontForLang(opts.lang);
+  let t = String(text).replace(/\r?\n/g, '\\N').replace(/\{/g, '(').replace(/\}/g, ')');
+  if (opts.rtl) t = '\u202B' + t + '\u202C';
+  const header =
+    '[Script Info]\nScriptType: v4.00+\nPlayResX: 1280\nPlayResY: 720\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n' +
+    '[V4+ Styles]\n' +
+    'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n' +
+    'Style: Default,' + fontName + ',30,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,3,1,' +
+      align + ',40,40,' + marginV + ',1\n\n' +
+    '[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
+  return header + 'Dialogue: 0,' + assTime(0) + ',' + assTime(dur) + ',Default,,0,0,0,,' + t + '\n';
+}
+
+// Freeze the frame at `at` for `hold` seconds, keeping the rest of the clip.
+// Done as three re-encoded segments concatenated: [0..at] + still + [at..end].
+// Audio is preserved on the two moving parts; the still holds silence.
+async function freezeFrame(inPath, outPath, at, hold, tmpDir) {
+  const probe = await probeClip(inPath);
+  const dur = probe.duration || 0;
+  const hasA = probe.hasAudio;
+  const enc = ['-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-r 30'];
+  const encA = hasA ? ['-c:a aac', '-b:a 192k', '-ar 48000'] : ['-an'];
+  const atC = Math.min(Math.max(at, 0), Math.max(0, dur - 0.05));
+
+  function seg(start, len, out) {
+    return new Promise((resolve, reject) => {
+      const c = ffmpeg().input(inPath).setStartTime(start);
+      if (len) c.duration(len);
+      c.outputOptions(enc.concat(encA)).output(out)
+        .on('end', resolve).on('error', e => reject(new Error('freeze seg: ' + e.message))).run();
+    });
+  }
+  // Still frame -> a `hold`s clip at the source resolution, silent.
+  function still(out) {
+    return new Promise((resolve, reject) => {
+      const framePng = path.join(tmpDir, 'frame.png');
+      ffmpeg().input(inPath).seekInput(atC).frames(1).output(framePng)
+        .on('end', () => {
+          const c = ffmpeg().input(framePng).loop(hold).inputOptions(['-framerate 30']);
+          if (hasA) c.input('anullsrc=channel_layout=stereo:sample_rate=48000').inputOptions(['-f lavfi']);
+          const oo = ['-t ' + hold, '-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-r 30', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2'];
+          if (hasA) { oo.push('-c:a aac', '-b:a 192k', '-ar 48000', '-shortest'); } else { oo.push('-an'); }
+          c.outputOptions(oo).output(out)
+            .on('end', resolve).on('error', e => reject(new Error('freeze still: ' + e.message))).run();
+        })
+        .on('error', e => reject(new Error('freeze frame extract: ' + e.message))).run();
+    });
+  }
+
+  const p1 = path.join(tmpDir, 'p1.mp4');
+  const p2 = path.join(tmpDir, 'p2.mp4');
+  const st = path.join(tmpDir, 'still.mp4');
+  const parts = [];
+  if (atC > 0.15) { await seg(0, atC, p1); parts.push(p1); }
+  await still(st); parts.push(st);
+  if (dur - atC > 0.15) { await seg(atC, null, p2); parts.push(p2); }
+
+  const listFile = path.join(tmpDir, 'flist.txt');
+  fs.writeFileSync(listFile, parts.map(f => `file '${f}'`).join('\n'));
+  await mergeVideos(listFile, outPath);
+}
+
+// Turn one image into a `sec`-second Ken Burns clip at target dims.
+// Alternates slow zoom-in / zoom-out per index so a slideshow feels alive.
+function kenBurnsClip(imgPath, outPath, sec, dims, idx) {
+  const fps = 30;
+  const frames = Math.round(sec * fps);
+  const zoomIn = (idx % 2 === 0);
+  // Oversample then zoompan for smooth motion, pad to exact aspect.
+  const z = zoomIn
+    ? `z='min(zoom+0.0012,1.2)'`
+    : `z='if(eq(on,1),1.2,max(zoom-0.0012,1.0))'`;
+  const vf =
+    `scale=${dims.w * 2}:${dims.h * 2}:force_original_aspect_ratio=increase,` +
+    `crop=${dims.w * 2}:${dims.h * 2},` +
+    `zoompan=${z}:d=${frames}:s=${dims.w}x${dims.h}:fps=${fps}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',` +
+    `setsar=1,format=yuv420p`;
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(imgPath).loop(sec).inputOptions(['-framerate ' + fps])
+      .videoFilters(vf)
+      .outputOptions(['-t ' + sec, '-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-r ' + fps, '-an'])
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', e => reject(new Error('kenburns ffmpeg error: ' + e.message)))
+      .run();
+  });
+}
+
+// Combine two videos side-by-side (hstack) or stacked (vstack), fit to aspect.
+// Takes the shorter of the two durations. Mixes both audio tracks if present.
+async function splitScreen(leftPath, rightPath, outPath, layout, aspect) {
+  const dims = aspectDims(aspect);
+  const side = String(layout) !== 'stack';
+  // Each pane is half the frame along the split axis.
+  const paneW = side ? Math.floor(dims.w / 2) : dims.w;
+  const paneH = side ? dims.h : Math.floor(dims.h / 2);
+  const [pl, pr] = await Promise.all([probeClip(leftPath), probeClip(rightPath)]);
+  const bothAudio = pl.hasAudio && pr.hasAudio;
+  const anyAudio = pl.hasAudio || pr.hasAudio;
+  const fit = (i) =>
+    `[${i}:v]scale=${paneW}:${paneH}:force_original_aspect_ratio=increase,crop=${paneW}:${paneH},setsar=1[v${i}]`;
+  const stackFilter = side ? `[v0][v1]hstack=inputs=2[v]` : `[v0][v1]vstack=inputs=2[v]`;
+  let filters = [fit(0), fit(1), stackFilter];
+  const maps = ['v'];
+  let audio = 'drop';
+  if (bothAudio) {
+    filters.push('[0:a][1:a]amix=inputs=2:duration=shortest:dropout_transition=0[a]');
+    maps.push('a'); audio = 'amix';
+  } else if (anyAudio) {
+    const ai = pl.hasAudio ? 0 : 1;
+    maps.push(ai + ':a'); audio = 'single';
+  }
+  await new Promise((resolve, reject) => {
+    const cmd = ffmpeg().input(leftPath).input(rightPath);
+    const out = ['-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-shortest', '-movflags +faststart'];
+    if (audio === 'drop') out.push('-an'); else out.push('-c:a aac', '-b:a 192k');
+    cmd.complexFilter(filters, maps).outputOptions(out).output(outPath)
+      .on('end', resolve)
+      .on('error', e => reject(new Error('split-screen ffmpeg error: ' + e.message)))
+      .run();
+  });
 }
 
 // ─── START ───────────────────────────────────────────────────
