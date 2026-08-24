@@ -511,7 +511,7 @@ app.post('/photo-video', async (req, res) => {
     const dims = aspectDims(b.aspect);
     const per = Math.min(Math.max(parseFloat(b.perImage) || 3, 1.5), 8);
     const clips = [];
-    for (let i = 0; i < images.length && i < 8; i++) {
+    for (let i = 0; i < images.length && i < 9; i++) {
       const img = path.join(tmpDir, `img_${i}` + (String(images[i]).match(/\.(png|webp|jpe?g)(\?|$)/i) ? '.' + RegExp.$1 : '.jpg'));
       await downloadFile(images[i], img);
       const clip = path.join(tmpDir, `clip_${i}.mp4`);
@@ -570,6 +570,49 @@ app.post('/split-screen', async (req, res) => {
     console.log(`[${job_id}] split-screen done — ${publicUrl}`);
   } catch (err) {
     console.error(`[${job_id}] split-screen error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+// ─── EXTRACT-LAST-FRAME ─── { video_url } → grabs the final frame as an image
+// Used by the seamless generator: clip N's last frame becomes clip N+1's
+// first frame, so a multi-clip video flows as one continuous shot.
+app.post('/extract-last-frame', async (req, res) => {
+  const b = req.body || {};
+  const { video_url, job_id } = b;
+  if (!video_url) return res.status(400).json({ error: 'video_url required' });
+  console.log(`[${job_id}] extract-last-frame started`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-lf-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'extract-last-frame started' });
+    const inPath = path.join(tmpDir, 'in.mp4');
+    await downloadFile(video_url, inPath);
+
+    const probe = await probeClip(inPath);
+    const dur = probe.duration || 0;
+    // seek slightly before the very end (the last frame can be blank/black)
+    const at = Math.max(0, dur - 0.1);
+    const framePath = path.join(tmpDir, 'lastframe.jpg');
+    await new Promise((resolve, reject) => {
+      ffmpeg().input(inPath).seekInput(at).frames(1)
+        .outputOptions(['-q:v', '2'])   // high-quality JPEG
+        .output(framePath)
+        .on('end', resolve)
+        .on('error', (e) => reject(new Error('frame extract: ' + e.message)))
+        .run();
+    });
+
+    await updateJob(job_id, 'uploading');
+    // Upload the JPG to R2 under an image key; return its public URL.
+    const publicUrl = await uploadOutputImage(job_id, framePath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] extract-last-frame done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] extract-last-frame error:`, err.message);
     await updateJob(job_id, 'error', null, err.message);
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
@@ -903,10 +946,13 @@ function r2sha256hex(d){ return require('crypto').createHash('sha256').update(d)
 function r2hmac(k, d){ return require('crypto').createHmac('sha256', k).update(d).digest(); }
 
 // SigV4-signed PUT to R2 (path-style). Returns the public URL.
-async function uploadToR2(job_id, filePath) {
+async function uploadToR2(job_id, filePath, opts) {
+  opts = opts || {};
+  const ext = opts.ext || 'mp4';
+  const contentType = opts.contentType || 'video/mp4';
   const crypto = require('crypto');
   const body = fs.readFileSync(filePath);
-  const key = `merged/${job_id}-${Date.now()}.mp4`;
+  const key = `merged/${job_id}-${Date.now()}.${ext}`;
   const now = new Date();
   const amzdate = now.toISOString().replace(/[:-]/g, '').replace(/\.\d{3}/, '');
   const datestamp = amzdate.slice(0, 8);
@@ -934,7 +980,7 @@ async function uploadToR2(job_id, filePath) {
       'Authorization': authorization,
       'x-amz-content-sha256': payloadHash,
       'x-amz-date': amzdate,
-      'Content-Type': 'video/mp4',
+      'Content-Type': contentType,
       'Content-Length': body.length,
     },
     body,
@@ -950,6 +996,19 @@ async function uploadToR2(job_id, filePath) {
 async function uploadOutput(job_id, filePath) {
   if (r2Ready()) return uploadToR2(job_id, filePath);
   return uploadToSupabase(job_id, filePath);
+}
+
+// Upload an image (JPG) output — used for seamless last-frame handoff.
+async function uploadOutputImage(job_id, filePath) {
+  if (r2Ready()) return uploadToR2(job_id, filePath, { ext: 'jpg', contentType: 'image/jpeg' });
+  // Supabase fallback
+  if (!supabase) throw new Error('No output storage configured.');
+  const fileBuffer = fs.readFileSync(filePath);
+  const fileName = `merged/${job_id}-${Date.now()}.jpg`;
+  const { error } = await supabase.storage.from(MERGE_BUCKET).upload(fileName, fileBuffer, { contentType: 'image/jpeg', upsert: true });
+  if (error) throw new Error('Supabase image upload failed: ' + error.message);
+  const { data } = supabase.storage.from(MERGE_BUCKET).getPublicUrl(fileName);
+  return data.publicUrl;
 }
 
 async function uploadToSupabase(job_id, filePath) {
