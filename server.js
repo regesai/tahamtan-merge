@@ -201,8 +201,10 @@ app.post('/caption', async (req, res) => {
 app.post('/finalize', async (req, res) => {
   const { video_url, job_id } = req.body || {};
   const boost = (req.body && req.body.boost === false) ? false : true;
+  const resolution = (req.body && req.body.resolution) || '1080p';   // '720p' | '1080p'
+  const aspect = (req.body && req.body.aspect) || '9:16';            // '9:16' | '1:1' | '16:9'
   if (!video_url) return res.status(400).json({ error: 'video_url required' });
-  console.log(`[${job_id}] Finalize job started — boost=${boost}`);
+  console.log(`[${job_id}] Finalize job started — boost=${boost} res=${resolution} aspect=${aspect}`);
   setJob(job_id, { status: 'processing' });
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-fin-'));
 
@@ -215,7 +217,15 @@ app.post('/finalize', async (req, res) => {
 
     await updateJob(job_id, 'optimizing');
     const outPath = path.join(tmpDir, 'out.mp4');
-    await finalizeForSocial(inPath, outPath, { boost: boost });
+    // If the caller didn't specify an aspect, keep the video's OWN shape
+    // (square stays square, landscape stays landscape) instead of forcing 9:16.
+    let useAspect = aspect;
+    if (!req.body || !req.body.aspect) {
+      const pr = await probeClip(inPath);
+      useAspect = detectAspect(pr.width, pr.height);
+      console.log(`[${job_id}] auto-detected aspect ${useAspect} from ${pr.width}x${pr.height}`);
+    }
+    await finalizeForSocial(inPath, outPath, { boost: boost, resolution: resolution, aspect: useAspect });
 
     await updateJob(job_id, 'uploading');
     const publicUrl = await uploadOutput(job_id, outPath);
@@ -703,19 +713,36 @@ function buildAss(cues, opts) {
 function finalizeForSocial(inPath, outPath, opts) {
   opts = opts || {};
   const boost = opts.boost !== false;
+  const resolution = opts.resolution || '1080p';
+  const aspect = opts.aspect || '9:16';
+
+  // Target dimensions from resolution + aspect. Short side = 720 or 1080.
+  const short = resolution === '720p' ? 720 : 1080;
+  let W, H;
+  if (aspect === '1:1')      { W = short;               H = short; }
+  else if (aspect === '16:9'){ W = Math.round(short*16/9); H = short; }   // landscape: 1280x720 / 1920x1080
+  else                       { W = short;               H = Math.round(short*16/9); } // 9:16: 720x1280 / 1080x1920
+  // keep even dimensions
+  W += W % 2; H += H % 2;
+
+  // Bitrate scales with resolution so 720p isn't wastefully large.
+  const bv = resolution === '720p' ? '6M'  : '12M';
+  const mx = resolution === '720p' ? '7M'  : '14M';
+  const bf = resolution === '720p' ? '10M' : '20M';
+
   return new Promise((resolve, reject) => {
-    // Fit any aspect into 1080x1920 without distortion, pad with black.
+    // Fit source into WxH without distortion, pad to exact frame.
     let vf =
-      "scale=1080:1920:force_original_aspect_ratio=decrease," +
-      "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black," +
-      "setsar=1,format=yuv420p";
+      `scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
+      `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,` +
+      `setsar=1,format=yuv420p`;
     if (boost) {
       // eq: tiny brightness + saturation; curves: lift shadows a touch.
-      vf = "scale=1080:1920:force_original_aspect_ratio=decrease," +
-           "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black," +
-           "eq=brightness=0.03:saturation=1.08:contrast=1.03," +
-           "curves=all='0/0.03 0.5/0.52 1/1'," +
-           "setsar=1,format=yuv420p";
+      vf = `scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
+           `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,` +
+           `eq=brightness=0.03:saturation=1.08:contrast=1.03,` +
+           `curves=all='0/0.03 0.5/0.52 1/1',` +
+           `setsar=1,format=yuv420p`;
     }
     ffmpeg()
       .input(inPath)
@@ -725,7 +752,7 @@ function finalizeForSocial(inPath, outPath, opts) {
         '-c:v', 'libx264',
         '-profile:v', 'high',
         '-preset', 'medium',
-        '-b:v', '12M', '-maxrate', '14M', '-bufsize', '20M',
+        '-b:v', bv, '-maxrate', mx, '-bufsize', bf,
         '-pix_fmt', 'yuv420p',
         '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
         '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
@@ -790,12 +817,22 @@ function mergeVideos(listFile, outputFile) {
 function probeClip(file) {
   return new Promise((resolve) => {
     ffmpeg.ffprobe(file, (err, data) => {
-      if (err || !data) return resolve({ duration: 0, hasAudio: false });
+      if (err || !data) return resolve({ duration: 0, hasAudio: false, width: 0, height: 0 });
       const duration = data.format && data.format.duration ? parseFloat(data.format.duration) : 0;
       const hasAudio = (data.streams || []).some((s) => s.codec_type === 'audio');
-      resolve({ duration: duration || 0, hasAudio });
+      const v = (data.streams || []).find((s) => s.codec_type === 'video') || {};
+      resolve({ duration: duration || 0, hasAudio, width: v.width || 0, height: v.height || 0 });
     });
   });
+}
+
+// Pick the closest standard aspect label from raw width/height.
+function detectAspect(w, h) {
+  if (!w || !h) return '9:16';
+  const r = w / h;
+  if (r >= 1.5) return '16:9';   // landscape
+  if (r <= 0.75) return '9:16';  // portrait
+  return '1:1';                  // roughly square
 }
 
 // Smooth merge: crossfade (dissolve) ~0.75s between clips so the joins
