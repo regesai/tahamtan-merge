@@ -781,10 +781,13 @@ function finalizeForSocial(inPath, outPath, opts) {
       `setsar=1,format=yuv420p`;
     if (boost) {
       // eq: tiny brightness + saturation; curves: lift shadows a touch.
+      // unsharp: light edge sharpening so upscaled 480p looks crisper/more HD.
+      // Brightness protection (survives social-media crush) is UNCHANGED.
       vf = `scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
            `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,` +
            `eq=brightness=0.03:saturation=1.08:contrast=1.03,` +
            `curves=all='0/0.03 0.5/0.52 1/1',` +
+           `unsharp=5:5:2.0:5:5:0.0,` +
            `setsar=1,format=yuv420p`;
     }
     ffmpeg()
