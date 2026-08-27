@@ -203,6 +203,9 @@ app.post('/finalize', async (req, res) => {
   const boost = (req.body && req.body.boost === false) ? false : true;
   const resolution = (req.body && req.body.resolution) || '1080p';   // '720p' | '1080p'
   const aspect = (req.body && req.body.aspect) || '9:16';            // '9:16' | '1:1' | '16:9'
+  // Watermark: server trusts the caller's flag. Frontend forces true for free
+  // plan; paid users choose. Defaults to true (safer — brand shows if unset).
+  const watermark = (req.body && req.body.watermark === false) ? false : true;
   if (!video_url) return res.status(400).json({ error: 'video_url required' });
   console.log(`[${job_id}] Finalize job started — boost=${boost} res=${resolution} aspect=${aspect}`);
   setJob(job_id, { status: 'processing' });
@@ -225,7 +228,7 @@ app.post('/finalize', async (req, res) => {
       useAspect = detectAspect(pr.width, pr.height);
       console.log(`[${job_id}] auto-detected aspect ${useAspect} from ${pr.width}x${pr.height}`);
     }
-    await finalizeForSocial(inPath, outPath, { boost: boost, resolution: resolution, aspect: useAspect });
+    await finalizeForSocial(inPath, outPath, { boost: boost, resolution: resolution, aspect: useAspect, watermark: watermark });
 
     await updateJob(job_id, 'uploading');
     const publicUrl = await uploadOutput(job_id, outPath);
@@ -789,6 +792,17 @@ function finalizeForSocial(inPath, outPath, opts) {
            `curves=all='0/0.03 0.5/0.52 1/1',` +
            `unsharp=5:5:2.0:5:5:0.0,` +
            `setsar=1,format=yuv420p`;
+    }
+    // WATERMARK — "TAHAMTAN AI" stamped bottom-right. Free plan forces it ON;
+    // paid plans pass watermark:false to remove it. Turns every free video into
+    // free marketing when shared on social media.
+    if (opts.watermark) {
+      const wmSize = Math.round(H * 0.028);   // scales with resolution
+      const pad = Math.round(H * 0.02);
+      vf += `,drawtext=font='Noto Sans':text='TAHAMTAN AI':` +
+            `fontcolor=white@0.75:fontsize=${wmSize}:` +
+            `shadowcolor=black@0.5:shadowx=2:shadowy=2:` +
+            `x=w-tw-${pad}:y=h-th-${pad}`;
     }
     ffmpeg()
       .input(inPath)
