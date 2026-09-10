@@ -8,7 +8,7 @@ FROM node:20-bullseye-slim
 #   fonts-noto-core  -> Latin, Cyrillic, Greek, Arabic, Devanagari, etc.
 #   fonts-noto-cjk   -> Chinese / Japanese / Korean
 #   fonts-noto-extra -> additional Noto faces
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
       ffmpeg \
       fontconfig \
       fonts-noto-core \
