@@ -16,10 +16,6 @@ const { createClient } = require('@supabase/supabase-js');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// Supabase (optional — only used as a fallback; primary storage is R2).
-// Wrapped in try/catch and a URL sanity check so a malformed SUPABASE_URL
-// can NEVER take the whole server down at boot (this was crashing Railway
-// inside RealtimeClient._initializeOptions).
 const SUPABASE_URL  = (process.env.SUPABASE_URL  || '').trim().replace(/\/+$/, '');
 const SUPABASE_KEY  = (process.env.SUPABASE_KEY  || '').trim();
 let supabase = null;
@@ -37,13 +33,9 @@ try {
   supabase = null;
 }
 
-// Bucket for merged videos — MUST exist in Supabase Storage and be public-read.
 const MERGE_BUCKET = process.env.MERGE_BUCKET || 'videos';
 
 // ── In-memory job status ──────────────────────────────────────
-// Authoritative source the browser polls via GET /status/:job_id.
-// Removes any dependency on Supabase RLS for the browser to read
-// merge results (browser anon key often can't SELECT merge_jobs).
 const jobs = {};
 function setJob(id, patch) {
   if (!id) return;
@@ -54,7 +46,6 @@ function setJob(id, patch) {
     { updated: Date.now() }
   );
 }
-// Evict jobs older than 1h so memory doesn't grow unbounded.
 setInterval(function () {
   const cutoff = Date.now() - 60 * 60 * 1000;
   for (const k of Object.keys(jobs)) { if (jobs[k].updated < cutoff) delete jobs[k]; }
@@ -68,16 +59,15 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'tahamtan-merge', timestamp: new Date().toISOString() });
 });
 
-// ─── STATUS (browser polls this — always readable, no RLS) ───
+// ─── STATUS ──────────────────────────────────────────────────
 app.get('/status/:job_id', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const j = jobs[req.params.job_id];
   if (!j) return res.json({ status: 'unknown' });
-  // Return the URL under every field name the frontend might read.
   res.json({ status: j.status, url: j.url, output_url: j.url, video_url: j.url, error: j.error });
 });
 
-// ─── PROXY (for CORS issues with Atlas video URLs) ───────────
+// ─── PROXY ───────────────────────────────────────────────────
 app.get('/proxy', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'url param required' });
@@ -105,11 +95,9 @@ app.post('/merge', async (req, res) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-'));
 
   try {
-    // Update Supabase status: downloading
     await updateJob(job_id, 'downloading');
     res.json({ status: 'processing', job_id, message: 'Merge started' });
 
-    // 1. Download all clips
     const localFiles = [];
     for (let i = 0; i < clips.length; i++) {
       const localPath = path.join(tmpDir, `clip_${i}.mp4`);
@@ -118,15 +106,12 @@ app.post('/merge', async (req, res) => {
       localFiles.push(localPath);
     }
 
-    // 2. Update status: merging
     await updateJob(job_id, 'merging');
 
-    // 3. Create concat list
     const listFile = path.join(tmpDir, 'list.txt');
     const listContent = localFiles.map(f => `file '${f}'`).join('\n');
     fs.writeFileSync(listFile, listContent);
 
-    // 4. Merge with ffmpeg — smooth crossfade joins, fall back to hard concat on any error
     const outputFile = path.join(tmpDir, 'merged.mp4');
     try {
       await mergeVideosSmooth(localFiles, outputFile);
@@ -137,11 +122,9 @@ app.post('/merge', async (req, res) => {
       console.log(`[${job_id}] Concat merge complete — ${outputFile}`);
     }
 
-    // 5. Upload to Supabase Storage
     await updateJob(job_id, 'uploading');
     const publicUrl = await uploadOutput(job_id, outputFile);
 
-    // 6. Done — update job with video URL
     await updateJob(job_id, 'done', publicUrl);
     console.log(`[${job_id}] Done — ${publicUrl}`);
 
@@ -149,15 +132,11 @@ app.post('/merge', async (req, res) => {
     console.error(`[${job_id}] Error:`, err.message);
     await updateJob(job_id, 'error', null, err.message);
   } finally {
-    // Cleanup temp files
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
   }
 });
 
-// ─── CAPTION (burn subtitles into a video) ───────────────────
-// Body: { video_url, cues:[{start,end,text}], job_id, rtl?, style? }
-//   start/end in seconds. Burns ASS subtitles into the MP4 (permanent),
-//   so captions survive download and sharing. Status via /status/:job_id.
+// ─── CAPTION ─────────────────────────────────────────────────
 app.post('/caption', async (req, res) => {
   const { video_url, cues, job_id, rtl, style } = req.body || {};
   if (!video_url || !Array.isArray(cues) || cues.length === 0) {
@@ -193,18 +172,12 @@ app.post('/caption', async (req, res) => {
   }
 });
 
-// ─── FINALIZE (optimize for social platforms) ───────────────
-// Body: { video_url, job_id, boost? }
-// Re-wraps the video as a clean 1080x1920 H.264/AAC file with BT.709
-// color and a healthy bitrate, plus a light brightness/shadow/saturation
-// lift so it survives TikTok/Reels/Shorts compression without darkening.
+// ─── FINALIZE ────────────────────────────────────────────────
 app.post('/finalize', async (req, res) => {
   const { video_url, job_id } = req.body || {};
   const boost = (req.body && req.body.boost === false) ? false : true;
-  const resolution = (req.body && req.body.resolution) || '1080p';   // '720p' | '1080p'
-  const aspect = (req.body && req.body.aspect) || '9:16';            // '9:16' | '1:1' | '16:9'
-  // Watermark: server trusts the caller's flag. Frontend forces true for free
-  // plan; paid users choose. Defaults to true (safer — brand shows if unset).
+  const resolution = (req.body && req.body.resolution) || '1080p';
+  const aspect = (req.body && req.body.aspect) || '9:16';
   const watermark = (req.body && req.body.watermark === false) ? false : true;
   if (!video_url) return res.status(400).json({ error: 'video_url required' });
   console.log(`[${job_id}] Finalize job started — boost=${boost} res=${resolution} aspect=${aspect}`);
@@ -220,8 +193,6 @@ app.post('/finalize', async (req, res) => {
 
     await updateJob(job_id, 'optimizing');
     const outPath = path.join(tmpDir, 'out.mp4');
-    // If the caller didn't specify an aspect, keep the video's OWN shape
-    // (square stays square, landscape stays landscape) instead of forcing 9:16.
     let useAspect = aspect;
     if (!req.body || !req.body.aspect) {
       const pr = await probeClip(inPath);
@@ -242,12 +213,7 @@ app.post('/finalize', async (req, res) => {
   }
 });
 
-// ─── MUSIC (mix a background track into a video) ─────────────
-// Body: { video_url, audio_url, job_id, volume?, duck? }
-//   volume: 0..1 music level (default 0.35)
-//   duck:   true → auto-lower music under any speech (default true)
-// Loops the track to fill the video, ducks under speech, fades out the
-// tail, and keeps any original voice. Status via /status/:job_id.
+// ─── MUSIC ───────────────────────────────────────────────────
 app.post('/music', async (req, res) => {
   const { video_url, audio_url, job_id } = req.body || {};
   const volume = Math.min(Math.max(parseFloat(req.body && req.body.volume) || 0.35, 0), 1);
@@ -286,13 +252,8 @@ app.post('/music', async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // EDIT-TAB ENDPOINTS
-// Each mirrors the /caption pattern: respond 'processing' immediately,
-// run ffmpeg async, then updateJob(...,'done',url). Browser polls
-// /status/:job_id and reads .url. All re-encode with libx264/yuv420p
-// so the result plays everywhere and can be chained tool→tool.
 // ═══════════════════════════════════════════════════════════════
 
-// Generic single-input job runner. `runner(inPath,outPath,body)` does the ffmpeg.
 async function runVideoJob(req, res, tag, runner) {
   const body = req.body || {};
   const { video_url, job_id } = body;
@@ -320,8 +281,6 @@ async function runVideoJob(req, res, tag, runner) {
   }
 }
 
-// Run ffmpeg with either a videoFilters string (vf) or a complexFilter (complex+maps).
-// Copies/encodes audio sensibly. Used by most edit runners.
 function runFF(inPath, outPath, opts) {
   opts = opts || {};
   return new Promise((resolve, reject) => {
@@ -335,7 +294,6 @@ function runFF(inPath, outPath, opts) {
     } else if (opts.vf) {
       cmd.videoFilters(opts.vf);
     }
-    // Audio handling: 'copy' (default), 'encode', 'drop', or a filter via opts.af
     if (opts.audio === 'drop') { out.push('-an'); }
     else if (opts.af) { cmd.audioFilters(opts.af); out.push('-c:a', 'aac', '-b:a', '192k'); }
     else if (opts.audio === 'encode') { out.push('-c:a', 'aac', '-b:a', '192k'); }
@@ -349,7 +307,7 @@ function runFF(inPath, outPath, opts) {
   });
 }
 
-// ─── TRIM ─── { start, end } seconds
+// ─── TRIM ────────────────────────────────────────────────────
 app.post('/trim', (req, res) => runVideoJob(req, res, 'trim', async (inPath, outPath, b) => {
   const start = Math.max(0, parseFloat(b.start) || 0);
   const end = parseFloat(b.end) || 0;
@@ -362,13 +320,12 @@ app.post('/trim', (req, res) => runVideoJob(req, res, 'trim', async (inPath, out
   });
 }));
 
-// ─── SPEED ─── { rate }  0.25..4  (video setpts + audio atempo, chained)
+// ─── SPEED ───────────────────────────────────────────────────
 app.post('/speed', (req, res) => runVideoJob(req, res, 'speed', async (inPath, outPath, b) => {
   let rate = parseFloat(b.rate) || 1;
   rate = Math.min(Math.max(rate, 0.25), 4);
   const probe = await probeClip(inPath);
   const vpts = (1 / rate).toFixed(5);
-  // atempo only accepts 0.5..2.0 — chain factors to reach the target rate.
   function atempoChain(r) {
     const parts = []; let x = r;
     while (x > 2.0) { parts.push('atempo=2.0'); x /= 2.0; }
@@ -386,7 +343,7 @@ app.post('/speed', (req, res) => runVideoJob(req, res, 'speed', async (inPath, o
   }
 }));
 
-// ─── VOLUME ─── { volume }  0..3  (1 = unchanged)
+// ─── VOLUME ──────────────────────────────────────────────────
 app.post('/volume', (req, res) => runVideoJob(req, res, 'volume', async (inPath, outPath, b) => {
   const vol = Math.min(Math.max(parseFloat(b.volume), 0), 3);
   const probe = await probeClip(inPath);
@@ -394,7 +351,7 @@ app.post('/volume', (req, res) => runVideoJob(req, res, 'volume', async (inPath,
   await runFF(inPath, outPath, { af: 'volume=' + (isNaN(vol) ? 1 : vol), tag: 'volume' });
 }));
 
-// ─── FILTER ─── { preset }  vivid|warm|cool|cinema|bw|bright
+// ─── FILTER ──────────────────────────────────────────────────
 app.post('/filter', (req, res) => runVideoJob(req, res, 'filter', async (inPath, outPath, b) => {
   const p = String(b.preset || '').toLowerCase();
   const map = {
@@ -409,10 +366,9 @@ app.post('/filter', (req, res) => runVideoJob(req, res, 'filter', async (inPath,
   await runFF(inPath, outPath, { vf, tag: 'filter' });
 }));
 
-// ─── EFFECT ─── { effect }  glow|sparkle|dream|vhs|vignette|warm_glow
+// ─── EFFECT ──────────────────────────────────────────────────
 app.post('/effect', (req, res) => runVideoJob(req, res, 'effect', async (inPath, outPath, b) => {
   const e = String(b.effect || '').toLowerCase();
-  // Bloom-style effects use a screen blend of a blurred copy over the original.
   const bloom = (sigma, op, pre) =>
     ({ complex: `[0:v]${pre || 'null'}[base];[base]split[a][b];[b]gblur=sigma=${sigma}[bl];[a][bl]blend=all_mode=screen:all_opacity=${op}[v]`, maps: ['v'] });
   let opts;
@@ -429,7 +385,7 @@ app.post('/effect', (req, res) => runVideoJob(req, res, 'effect', async (inPath,
   await runFF(inPath, outPath, opts);
 }));
 
-// ─── REFRAME ─── { aspect }  9:16 | 1:1 | 16:9  (scale+pad, no crop/distort)
+// ─── REFRAME ─────────────────────────────────────────────────
 app.post('/reframe', (req, res) => runVideoJob(req, res, 'reframe', async (inPath, outPath, b) => {
   const dims = aspectDims(b.aspect);
   const vf = `scale=${dims.w}:${dims.h}:force_original_aspect_ratio=decrease,` +
@@ -437,7 +393,7 @@ app.post('/reframe', (req, res) => runVideoJob(req, res, 'reframe', async (inPat
   await runFF(inPath, outPath, { vf, tag: 'reframe' });
 }));
 
-// ─── FADE ─── { fade }  seconds of fade in + fade out
+// ─── FADE ────────────────────────────────────────────────────
 app.post('/fade', (req, res) => runVideoJob(req, res, 'fade', async (inPath, outPath, b) => {
   const f = Math.min(Math.max(parseFloat(b.fade) || 1, 0.2), 5);
   const probe = await probeClip(inPath);
@@ -454,7 +410,7 @@ app.post('/fade', (req, res) => runVideoJob(req, res, 'fade', async (inPath, out
   }
 }));
 
-// ─── TEXT ─── { text, pos(top|center|bottom), lang }  burn a title over the whole clip
+// ─── TEXT ────────────────────────────────────────────────────
 app.post('/text', (req, res) => runVideoJob(req, res, 'text', async (inPath, outPath, b, tmpDir) => {
   const text = String(b.text || '').trim();
   if (!text) throw new Error('text required');
@@ -468,12 +424,12 @@ app.post('/text', (req, res) => runVideoJob(req, res, 'text', async (inPath, out
   await burnSubtitles(inPath, assPath, outPath, tmpDir);
 }));
 
-// ─── STICKER ─── { emoji, pos(br|bl|tr|tl|center), size }  overlay an emoji
+// ─── STICKER ─────────────────────────────────────────────────
 app.post('/sticker', (req, res) => runVideoJob(req, res, 'sticker', async (inPath, outPath, b, tmpDir) => {
   const emoji = String(b.emoji || '🔥');
   const size = Math.min(Math.max(parseInt(b.size, 10) || 160, 40), 400);
   const pos = String(b.pos || 'br');
-  const M = 40; // margin from edges
+  const M = 40;
   const posMap = {
     br: `x=w-tw-${M}:y=h-th-${M}`, bl: `x=${M}:y=h-th-${M}`,
     tr: `x=w-tw-${M}:y=${M}`,       tl: `x=${M}:y=${M}`,
@@ -481,7 +437,6 @@ app.post('/sticker', (req, res) => runVideoJob(req, res, 'sticker', async (inPat
   };
   const xy = posMap[pos] || posMap.br;
   const fontFile = process.env.EMOJI_FONT || '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf';
-  // Write emoji to a textfile so unicode survives the filter graph.
   const txtPath = path.join(tmpDir, 'sticker.txt');
   fs.writeFileSync(txtPath, emoji, 'utf8');
   const esc = txtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
@@ -490,14 +445,14 @@ app.post('/sticker', (req, res) => runVideoJob(req, res, 'sticker', async (inPat
   await runFF(inPath, outPath, { vf, tag: 'sticker' });
 }));
 
-// ─── FREEZE ─── { at, hold }  hold the frame at `at` for `hold` seconds
+// ─── FREEZE ──────────────────────────────────────────────────
 app.post('/freeze', (req, res) => runVideoJob(req, res, 'freeze', async (inPath, outPath, b, tmpDir) => {
   const at = Math.max(0, parseFloat(b.at) || 0);
   const hold = Math.min(Math.max(parseFloat(b.hold) || 1.5, 0.3), 10);
   await freezeFrame(inPath, outPath, at, hold, tmpDir);
 }));
 
-// ─── PHOTO-VIDEO ─── { images:[], aspect, transition, perImage }  Ken Burns slideshow
+// ─── PHOTO-VIDEO ─────────────────────────────────────────────
 app.post('/photo-video', async (req, res) => {
   const b = req.body || {};
   const images = b.images;
@@ -549,7 +504,7 @@ app.post('/photo-video', async (req, res) => {
   }
 });
 
-// ─── SPLIT-SCREEN ─── { left_url, right_url, layout(side|stack), aspect }
+// ─── SPLIT-SCREEN ─────────────────────────────────────────────
 app.post('/split-screen', async (req, res) => {
   const b = req.body || {};
   const { left_url, right_url, job_id } = b;
@@ -579,9 +534,7 @@ app.post('/split-screen', async (req, res) => {
   }
 });
 
-// ─── EXTRACT-LAST-FRAME ─── { video_url } → grabs the final frame as an image
-// Used by the seamless generator: clip N's last frame becomes clip N+1's
-// first frame, so a multi-clip video flows as one continuous shot.
+// ─── EXTRACT-LAST-FRAME ───────────────────────────────────────
 app.post('/extract-last-frame', async (req, res) => {
   const b = req.body || {};
   const { video_url, job_id } = b;
@@ -597,12 +550,11 @@ app.post('/extract-last-frame', async (req, res) => {
 
     const probe = await probeClip(inPath);
     const dur = probe.duration || 0;
-    // seek slightly before the very end (the last frame can be blank/black)
     const at = Math.max(0, dur - 0.1);
     const framePath = path.join(tmpDir, 'lastframe.jpg');
     await new Promise((resolve, reject) => {
       ffmpeg().input(inPath).seekInput(at).frames(1)
-        .outputOptions(['-q:v', '2'])   // high-quality JPEG
+        .outputOptions(['-q:v', '2'])
         .output(framePath)
         .on('end', resolve)
         .on('error', (e) => reject(new Error('frame extract: ' + e.message)))
@@ -610,7 +562,6 @@ app.post('/extract-last-frame', async (req, res) => {
     });
 
     await updateJob(job_id, 'uploading');
-    // Upload the JPG to R2 under an image key; return its public URL.
     const publicUrl = await uploadOutputImage(job_id, framePath);
     await updateJob(job_id, 'done', publicUrl);
     console.log(`[${job_id}] extract-last-frame done — ${publicUrl}`);
@@ -622,14 +573,67 @@ app.post('/extract-last-frame', async (req, res) => {
   }
 });
 
+// ─── VOICE-MERGE (replace Seedance silent audio with Google TTS) ──────────
+// Body: { video_url, audio_url, job_id }
+//   video_url : silent Seedance MP4
+//   audio_url : Google TTS output (WAV / MP3 / M4A)
+// Replaces the video's audio track entirely with the TTS voice.
+// -shortest trims audio to video length so nothing hangs.
+// Status via /status/:job_id.
+app.post('/voice-merge', async (req, res) => {
+  const { video_url, audio_url, job_id } = req.body || {};
+  if (!video_url || !audio_url) {
+    return res.status(400).json({ error: 'video_url and audio_url required' });
+  }
+  console.log(`[${job_id}] voice-merge started`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-vm-'));
+
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'voice-merge started' });
+
+    const vPath = path.join(tmpDir, 'video.mp4');
+    const aExt = String(audio_url).match(/\.(mp3|wav|m4a|aac|ogg)(\?|$)/i) ? RegExp.$1 : 'mp3';
+    const aPath = path.join(tmpDir, 'audio.' + aExt);
+    await downloadFile(video_url, vPath);
+    await downloadFile(audio_url, aPath);
+
+    await updateJob(job_id, 'merging');
+    const outPath = path.join(tmpDir, 'out.mp4');
+
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(vPath)
+        .input(aPath)
+        .outputOptions([
+          '-map', '0:v',        // video from Seedance clip
+          '-map', '1:a',        // audio from Google TTS
+          '-c:v', 'copy',       // no re-encode — fast + lossless
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+          '-shortest',          // stop at video end (TTS may be slightly shorter/longer)
+          '-movflags', '+faststart'
+        ])
+        .output(outPath)
+        .on('end', resolve)
+        .on('error', (err) => reject(new Error('voice-merge ffmpeg error: ' + err.message)))
+        .run();
+    });
+
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] voice-merge done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] voice-merge error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
 // ─── HELPERS ─────────────────────────────────────────────────
 
-// Mix a looping background track into a video.
-//  - Loops music to fill the whole video (-stream_loop -1) then trims to length.
-//  - If the video has its own audio (voice) and duck=true, the music is
-//    side-chain compressed so it dips under speech, then the two are mixed.
-//  - If the video has no audio, the music simply plays under it.
-//  - Music tail fades out over ~1.5s.
 async function mixMusic(videoPath, audioPath, outPath, opts) {
   opts = opts || {};
   const vol = (opts.volume != null) ? opts.volume : 0.35;
@@ -643,7 +647,7 @@ async function mixMusic(videoPath, audioPath, outPath, opts) {
   return new Promise((resolve, reject) => {
     const cmd = ffmpeg();
     cmd.input(videoPath);
-    cmd.input(audioPath).inputOptions(['-stream_loop -1']); // loop music
+    cmd.input(audioPath).inputOptions(['-stream_loop -1']);
 
     let filter, mapAudio;
     const musicChain =
@@ -652,7 +656,6 @@ async function mixMusic(videoPath, audioPath, outPath, opts) {
       '[mus]';
 
     if (hasVoice && duck) {
-      // Duck music under the voice, then mix voice + ducked music.
       filter =
         musicChain + ';' +
         '[mus][0:a]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300[ducked];' +
@@ -669,9 +672,9 @@ async function mixMusic(videoPath, audioPath, outPath, opts) {
     const outOpts = [
       '-map', '0:v',
       '-map', mapAudio,
-      '-c:v', 'copy',            // don't re-encode video — fast + lossless
+      '-c:v', 'copy',
       '-c:a', 'aac', '-b:a', '192k',
-      '-shortest',               // stop at video length (music is looped/longer)
+      '-shortest',
       '-movflags', '+faststart'
     ];
 
@@ -684,7 +687,6 @@ async function mixMusic(videoPath, audioPath, outPath, opts) {
   });
 }
 
-// Convert seconds -> ASS time "H:MM:SS.cs"
 function assTime(sec) {
   sec = Math.max(0, Number(sec) || 0);
   const h = Math.floor(sec / 3600);
@@ -695,27 +697,22 @@ function assTime(sec) {
   return h + ':' + p2(m) + ':' + p2(s) + '.' + p2(cs);
 }
 
-// Pick the Noto font family that covers a language's script.
-// These families are all provided by fonts-noto-core / fonts-noto-cjk
-// (installed via the Dockerfile), so fontconfig resolves them.
 function fontForLang(lang) {
   switch (String(lang || '').toLowerCase()) {
     case 'ar': case 'fa': case 'ur': return 'Noto Sans Arabic';
     case 'hi':                       return 'Noto Sans Devanagari';
     case 'zh':                       return 'Noto Sans CJK SC';
-    default:                         return 'Noto Sans'; // Latin + Cyrillic + Greek
+    default:                         return 'Noto Sans';
   }
 }
 
-// Build a styled ASS subtitle file from cues. Social look: big bold text,
-// thick outline, bottom-centred. RTL-aware for fa/ar/ur.
 function buildAss(cues, opts) {
   opts = opts || {};
   const st = opts.style || {};
   const fontName = st.font || fontForLang(opts.lang);
   const fontSize = st.size || 22;
-  const primary  = st.primary  || '&H00FFFFFF';  // white   (AABBGGRR)
-  const outline  = st.outline  || '&H00000000';  // black
+  const primary  = st.primary  || '&H00FFFFFF';
+  const outline  = st.outline  || '&H00000000';
   const outlineW = (st.outlineW != null) ? st.outlineW : 3;
   const shadow   = (st.shadow  != null) ? st.shadow  : 1;
   const marginV  = st.marginV || 40;
@@ -738,10 +735,8 @@ function buildAss(cues, opts) {
   const isRtl = !!opts.rtl;
   const lines = cues.map(function (c) {
     var text = String(c.text || '')
-      .replace(/\r?\n/g, '\\N')                    // ASS line break
-      .replace(/\{/g, '(').replace(/\}/g, ')');    // strip ASS override braces
-    // For Arabic/Persian/Urdu: wrap the line in an explicit RTL embedding
-    // (RLE … PDF) so word order and mixed numbers/Latin render correctly.
+      .replace(/\r?\n/g, '\\N')
+      .replace(/\{/g, '(').replace(/\}/g, ')');
     if (isRtl) text = '\u202B' + text + '\u202C';
     return 'Dialogue: 0,' + assTime(c.start) + ',' + assTime(c.end) +
       ',Default,,0,0,0,,' + text;
@@ -750,42 +745,29 @@ function buildAss(cues, opts) {
   return header + lines + '\n';
 }
 
-// Optimize a video for social platforms (TikTok / Reels / Shorts):
-//  - scale/pad to a clean 1080x1920 (9:16) container
-//  - H.264 High, yuv420p, BT.709 color tags (stops HDR darkening/shift)
-//  - ~12 Mbps target so the platform transcoder gets a clean source
-//  - light brightness + shadow lift + saturation so it survives the crush
-//  - 30fps, AAC 192k, +faststart
 function finalizeForSocial(inPath, outPath, opts) {
   opts = opts || {};
   const boost = opts.boost !== false;
   const resolution = opts.resolution || '1080p';
   const aspect = opts.aspect || '9:16';
 
-  // Target dimensions from resolution + aspect. Short side = 720 or 1080.
   const short = resolution === '720p' ? 720 : 1080;
   let W, H;
   if (aspect === '1:1')      { W = short;               H = short; }
-  else if (aspect === '16:9'){ W = Math.round(short*16/9); H = short; }   // landscape: 1280x720 / 1920x1080
-  else                       { W = short;               H = Math.round(short*16/9); } // 9:16: 720x1280 / 1080x1920
-  // keep even dimensions
+  else if (aspect === '16:9'){ W = Math.round(short*16/9); H = short; }
+  else                       { W = short;               H = Math.round(short*16/9); }
   W += W % 2; H += H % 2;
 
-  // Bitrate scales with resolution so 720p isn't wastefully large.
   const bv = resolution === '720p' ? '6M'  : '12M';
   const mx = resolution === '720p' ? '7M'  : '14M';
   const bf = resolution === '720p' ? '10M' : '20M';
 
   return new Promise((resolve, reject) => {
-    // Fit source into WxH without distortion, pad to exact frame.
     let vf =
       `scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
       `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,` +
       `setsar=1,format=yuv420p`;
     if (boost) {
-      // eq: tiny brightness + saturation; curves: lift shadows a touch.
-      // unsharp: light edge sharpening so upscaled 480p looks crisper/more HD.
-      // Brightness protection (survives social-media crush) is UNCHANGED.
       vf = `scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
            `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,` +
            `eq=brightness=0.03:saturation=1.08:contrast=1.03,` +
@@ -793,11 +775,8 @@ function finalizeForSocial(inPath, outPath, opts) {
            `unsharp=5:5:2.0:5:5:0.0,` +
            `setsar=1,format=yuv420p`;
     }
-    // WATERMARK — "TAHAMTAN AI" stamped bottom-right. Free plan forces it ON;
-    // paid plans pass watermark:false to remove it. Turns every free video into
-    // free marketing when shared on social media.
     if (opts.watermark) {
-      const wmSize = Math.round(H * 0.028);   // scales with resolution
+      const wmSize = Math.round(H * 0.028);
       const pad = Math.round(H * 0.02);
       vf += `,drawtext=font='Noto Sans':text='TAHAMTAN AI':` +
             `fontcolor=white@0.75:fontsize=${wmSize}:` +
@@ -825,13 +804,8 @@ function finalizeForSocial(inPath, outPath, opts) {
   });
 }
 
-// Burn the ASS file into the video. Re-encodes video, copies audio.
-// fontsdir lets us ship a font that covers Persian/Arabic/Urdu.
 function burnSubtitles(inPath, assPath, outPath, workDir) {
   return new Promise((resolve, reject) => {
-    // Escape the path for ffmpeg's filter graph. Fonts are resolved by
-    // fontconfig from the system Noto fonts installed in the Docker image,
-    // so no fontsdir is needed (optional override via FONTS_DIR).
     const escaped = assPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
     let vf = "ass='" + escaped + "'";
     if (process.env.FONTS_DIR) {
@@ -873,7 +847,6 @@ function mergeVideos(listFile, outputFile) {
   });
 }
 
-// Probe a clip for duration + whether it carries an audio track
 function probeClip(file) {
   return new Promise((resolve) => {
     ffmpeg.ffprobe(file, (err, data) => {
@@ -886,30 +859,24 @@ function probeClip(file) {
   });
 }
 
-// Pick the closest standard aspect label from raw width/height.
 function detectAspect(w, h) {
   if (!w || !h) return '9:16';
   const r = w / h;
-  if (r >= 1.5) return '16:9';   // landscape
-  if (r <= 0.75) return '9:16';  // portrait
-  return '1:1';                  // roughly square
+  if (r >= 1.5) return '16:9';
+  if (r <= 0.75) return '9:16';
+  return '1:1';
 }
 
-// Smooth merge: crossfade (dissolve) ~0.75s between clips so the joins
-// aren't hard cuts. Re-encodes (xfade can't stream-copy). Falls back to
-// plain concat upstream if this throws.
 async function mergeVideosSmooth(files, outputFile) {
-  const T = 0.75; // crossfade duration (seconds)
+  const T = 0.75;
   if (!files || files.length < 2) throw new Error('need >= 2 clips');
 
-  // Need real durations to place each crossfade
   const probes = [];
   for (const f of files) probes.push(await probeClip(f));
   const durs = probes.map((p) => p.duration);
   if (durs.some((d) => !d || d <= T + 0.2)) throw new Error('clip durations unusable for crossfade');
   const allAudio = probes.every((p) => p.hasAudio);
 
-  // Video: chain xfade transitions. offset = running merged length - T.
   const filters = [];
   let acc = durs[0];
   let prevV = '0:v';
@@ -921,7 +888,6 @@ async function mergeVideosSmooth(files, outputFile) {
     prevV = out;
   }
 
-  // Audio: acrossfade chain, only if every clip actually has audio
   const maps = ['vout'];
   if (allAudio) {
     let prevA = '0:a';
@@ -948,8 +914,6 @@ async function mergeVideosSmooth(files, outputFile) {
 }
 
 // ─── OUTPUT STORAGE ──────────────────────────────────────────
-// Prefer Cloudflare R2 (the rest of the stack uses R2). Falls back to
-// Supabase Storage only if R2 isn't configured.
 const R2_ACCOUNT   = process.env.CF_ACCOUNT_ID || '';
 const R2_BUCKET    = process.env.R2_BUCKET || 'tahamtan-videos';
 const R2_KEY_ID    = process.env.R2_ACCESS_KEY_ID || '';
@@ -962,7 +926,6 @@ function r2Ready() { return !!(R2_ACCOUNT && R2_KEY_ID && R2_SECRET && R2_PUBLIC
 function r2sha256hex(d){ return require('crypto').createHash('sha256').update(d).digest('hex'); }
 function r2hmac(k, d){ return require('crypto').createHmac('sha256', k).update(d).digest(); }
 
-// SigV4-signed PUT to R2 (path-style). Returns the public URL.
 async function uploadToR2(job_id, filePath, opts) {
   opts = opts || {};
   const ext = opts.ext || 'mp4';
@@ -1009,16 +972,13 @@ async function uploadToR2(job_id, filePath, opts) {
   return `${R2_PUBLIC}/${key}`;
 }
 
-// Unified output upload: R2 first, Supabase fallback.
 async function uploadOutput(job_id, filePath) {
   if (r2Ready()) return uploadToR2(job_id, filePath);
   return uploadToSupabase(job_id, filePath);
 }
 
-// Upload an image (JPG) output — used for seamless last-frame handoff.
 async function uploadOutputImage(job_id, filePath) {
   if (r2Ready()) return uploadToR2(job_id, filePath, { ext: 'jpg', contentType: 'image/jpeg' });
-  // Supabase fallback
   if (!supabase) throw new Error('No output storage configured.');
   const fileBuffer = fs.readFileSync(filePath);
   const fileName = `merged/${job_id}-${Date.now()}.jpg`;
@@ -1047,13 +1007,10 @@ async function uploadToSupabase(job_id, filePath) {
 }
 
 async function updateJob(job_id, status, video_url = null, error = null) {
-  // In-memory first — this is what the browser polls via /status/:job_id.
   setJob(job_id, { status, url: video_url || (jobs[job_id] && jobs[job_id].url) || null, error });
 
   if (!supabase || !job_id) return;
   try {
-    // UPSERT (not update): the browser's anon insert may have been blocked by
-    // RLS, so the row might not exist yet. Upsert guarantees the write lands.
     const row = { id: job_id, status, updated_at: new Date().toISOString() };
     if (video_url) row.video_url = video_url;
     if (error)     row.error     = error;
@@ -1065,7 +1022,6 @@ async function updateJob(job_id, status, video_url = null, error = null) {
 
 // ─── EDIT-TAB HELPERS ────────────────────────────────────────
 
-// Target pixel dims for an aspect ratio label.
 function aspectDims(aspect) {
   switch (String(aspect || '9:16')) {
     case '1:1':  return { w: 1080, h: 1080 };
@@ -1075,8 +1031,6 @@ function aspectDims(aspect) {
   }
 }
 
-// Build a single-cue ASS that shows `text` for the whole clip, positioned
-// top / center / bottom. RTL-aware. Reuses the burnSubtitles pipeline.
 function buildTitleAss(text, opts) {
   opts = opts || {};
   const dur = Math.max(0.5, opts.dur || 5);
@@ -1095,9 +1049,6 @@ function buildTitleAss(text, opts) {
   return header + 'Dialogue: 0,' + assTime(0) + ',' + assTime(dur) + ',Default,,0,0,0,,' + t + '\n';
 }
 
-// Freeze the frame at `at` for `hold` seconds, keeping the rest of the clip.
-// Done as three re-encoded segments concatenated: [0..at] + still + [at..end].
-// Audio is preserved on the two moving parts; the still holds silence.
 async function freezeFrame(inPath, outPath, at, hold, tmpDir) {
   const probe = await probeClip(inPath);
   const dur = probe.duration || 0;
@@ -1114,7 +1065,6 @@ async function freezeFrame(inPath, outPath, at, hold, tmpDir) {
         .on('end', resolve).on('error', e => reject(new Error('freeze seg: ' + e.message))).run();
     });
   }
-  // Still frame -> a `hold`s clip at the source resolution, silent.
   function still(out) {
     return new Promise((resolve, reject) => {
       const framePng = path.join(tmpDir, 'frame.png');
@@ -1144,13 +1094,10 @@ async function freezeFrame(inPath, outPath, at, hold, tmpDir) {
   await mergeVideos(listFile, outPath);
 }
 
-// Turn one image into a `sec`-second Ken Burns clip at target dims.
-// Alternates slow zoom-in / zoom-out per index so a slideshow feels alive.
 function kenBurnsClip(imgPath, outPath, sec, dims, idx) {
   const fps = 30;
   const frames = Math.round(sec * fps);
   const zoomIn = (idx % 2 === 0);
-  // Oversample then zoompan for smooth motion, pad to exact aspect.
   const z = zoomIn
     ? `z='min(zoom+0.0012,1.2)'`
     : `z='if(eq(on,1),1.2,max(zoom-0.0012,1.0))'`;
@@ -1170,12 +1117,9 @@ function kenBurnsClip(imgPath, outPath, sec, dims, idx) {
   });
 }
 
-// Combine two videos side-by-side (hstack) or stacked (vstack), fit to aspect.
-// Takes the shorter of the two durations. Mixes both audio tracks if present.
 async function splitScreen(leftPath, rightPath, outPath, layout, aspect) {
   const dims = aspectDims(aspect);
   const side = String(layout) !== 'stack';
-  // Each pane is half the frame along the split axis.
   const paneW = side ? Math.floor(dims.w / 2) : dims.w;
   const paneH = side ? dims.h : Math.floor(dims.h / 2);
   const [pl, pr] = await Promise.all([probeClip(leftPath), probeClip(rightPath)]);
