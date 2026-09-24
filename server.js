@@ -154,8 +154,19 @@ app.post('/caption', async (req, res) => {
     await downloadFile(video_url, inPath);
 
     await updateJob(job_id, 'captioning');
+    // Probe the REAL video dimensions — buildAss() previously always
+    // declared a hardcoded 1280x720 (landscape) canvas regardless of the
+    // actual video's shape. Since most output here is vertical (9:16),
+    // libass had to scale a landscape-designed layout onto a portrait
+    // video, which distorts how font size actually renders — the size
+    // slider was sending the right number, but the mismatch made it look
+    // like it wasn't doing anything.
+    const capProbe = await probeClip(inPath);
     const assPath = path.join(tmpDir, 'sub.ass');
-    fs.writeFileSync(assPath, buildAss(cues, { rtl: !!rtl, lang: (req.body && req.body.lang) || '', style: style || {} }));
+    fs.writeFileSync(assPath, buildAss(cues, {
+      rtl: !!rtl, lang: (req.body && req.body.lang) || '', style: style || {},
+      resW: capProbe.width || 1280, resH: capProbe.height || 720
+    }));
 
     const outPath = path.join(tmpDir, 'out.mp4');
     await burnSubtitles(inPath, assPath, outPath, tmpDir);
@@ -247,6 +258,160 @@ app.post('/music', async (req, res) => {
     await updateJob(job_id, 'error', null, err.message);
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+  }
+});
+
+// ─── VOICE-MERGE (replace Seedance silent audio with Google TTS) ──────────
+// Body: { video_url, audio_url, job_id }
+//   video_url : silent Seedance MP4
+//   audio_url : Google TTS output (WAV / MP3 / M4A)
+// Replaces the video's audio track entirely with the TTS voice.
+// -shortest trims audio to video length so nothing hangs.
+// Status via /status/:job_id.
+app.post('/voice-merge', async (req, res) => {
+  const { video_url, audio_url, job_id } = req.body || {};
+  if (!video_url || !audio_url) {
+    return res.status(400).json({ error: 'video_url and audio_url required' });
+  }
+  console.log(`[${job_id}] voice-merge started`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-vm-'));
+
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'voice-merge started' });
+
+    const vPath = path.join(tmpDir, 'video.mp4');
+    const aExt = String(audio_url).match(/\.(mp3|wav|m4a|aac|ogg)(\?|$)/i) ? RegExp.$1 : 'mp3';
+    const aPath = path.join(tmpDir, 'audio.' + aExt);
+    await downloadFile(video_url, vPath);
+    await downloadFile(audio_url, aPath);
+
+    await updateJob(job_id, 'merging');
+    const outPath = path.join(tmpDir, 'out.mp4');
+
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(vPath)
+        .input(aPath)
+        .outputOptions([
+          '-map', '0:v',        // video from Seedance clip
+          '-map', '1:a',        // audio from Google TTS
+          '-c:v', 'copy',       // no re-encode — fast + lossless
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+          '-shortest',          // stop at video end (TTS may be slightly shorter/longer)
+          '-movflags', '+faststart'
+        ])
+        .output(outPath)
+        .on('end', resolve)
+        .on('error', (err) => reject(new Error('voice-merge ffmpeg error: ' + err.message)))
+        .run();
+    });
+
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] voice-merge done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] voice-merge error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+// ─── LIP-SYNC (Wav2Lip via Replicate) ─────────────────────────
+// Makes the video's mouth movements match the given audio — used for the
+// 11 languages that don't get Native Audio (everything except English and
+// Chinese, which Seedance already handles natively). Wav2Lip works purely
+// off the audio waveform, not language understanding, so it needs zero
+// per-language configuration — one endpoint covers all 11 automatically.
+//
+// Body: { video_url, audio_url, job_id }
+// Cost: ~$0.005-0.016 per run on Replicate's GPU — negligible against plan margins.
+//
+// REQUIRED env vars:
+//   REPLICATE_API_TOKEN     — from replicate.com/account/api-tokens
+//   REPLICATE_WAV2LIP_MODEL — "owner/name:versionhash", e.g.
+//     "devxpy/cog-wav2lip:3ee...". Copy the current version hash from the
+//     model's page on replicate.com (Docs/API tab) — community models
+//     (not Replicate's own "official" models) require this exact pinned
+//     version, not just the bare owner/name.
+app.post('/lip-sync', async (req, res) => {
+  const { video_url, audio_url, job_id } = req.body || {};
+  if (!video_url || !audio_url) {
+    return res.status(400).json({ error: 'video_url and audio_url required' });
+  }
+  const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
+  const REPLICATE_MODEL = process.env.REPLICATE_WAV2LIP_MODEL; // "owner/name:version"
+  if (!REPLICATE_TOKEN || !REPLICATE_MODEL) {
+    return res.status(500).json({ error: 'Lip-sync not configured — set REPLICATE_API_TOKEN and REPLICATE_WAV2LIP_MODEL' });
+  }
+
+  console.log(`[${job_id}] lip-sync started`);
+  setJob(job_id, { status: 'processing' });
+
+  try {
+    await updateJob(job_id, 'syncing');
+    res.json({ status: 'processing', job_id, message: 'lip-sync started' });
+
+    const version = REPLICATE_MODEL.includes(':') ? REPLICATE_MODEL.split(':')[1] : null;
+    if (!version) throw new Error('REPLICATE_WAV2LIP_MODEL must include a version hash, e.g. "owner/name:abc123..."');
+
+    // Create the prediction — Replicate runs this async, we poll for completion.
+    const createRes = await fetch('https://api.replicate.com/v1/predictions', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + REPLICATE_TOKEN,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        version: version,
+        input: { face: video_url, audio: audio_url }
+      })
+    });
+    if (!createRes.ok) {
+      const t = await createRes.text().catch(() => '');
+      throw new Error('Replicate create failed: ' + createRes.status + ' ' + t.slice(0, 300));
+    }
+    let prediction = await createRes.json();
+
+    // Poll until done. Wav2Lip typically completes in 6-7 seconds on
+    // Replicate's GPU, but allow a generous ceiling in case of queueing.
+    const started = Date.now();
+    const TIMEOUT_MS = 5 * 60 * 1000;
+    while (!['succeeded', 'failed', 'canceled'].includes(prediction.status)) {
+      if (Date.now() - started > TIMEOUT_MS) throw new Error('lip-sync timed out after 5 minutes');
+      await new Promise((r) => setTimeout(r, 2000));
+      const pollRes = await fetch('https://api.replicate.com/v1/predictions/' + prediction.id, {
+        headers: { 'Authorization': 'Bearer ' + REPLICATE_TOKEN }
+      });
+      prediction = await pollRes.json();
+    }
+    if (prediction.status !== 'succeeded') {
+      throw new Error('Replicate lip-sync failed: ' + (prediction.error || 'unknown error'));
+    }
+
+    const resultUrl = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+    if (!resultUrl) throw new Error('Replicate returned no output URL');
+
+    // Download Replicate's result and re-upload to our own storage, so the
+    // final URL is on our own domain like every other endpoint's output —
+    // Replicate's own hosted URLs are not guaranteed to stay available long-term.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-lip-'));
+    try {
+      const outPath = path.join(tmpDir, 'out.mp4');
+      await downloadFile(resultUrl, outPath);
+      await updateJob(job_id, 'uploading');
+      const publicUrl = await uploadOutput(job_id, outPath);
+      await updateJob(job_id, 'done', publicUrl);
+      console.log(`[${job_id}] lip-sync done — ${publicUrl}`);
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+    }
+  } catch (err) {
+    console.error(`[${job_id}] lip-sync error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
   }
 });
 
@@ -573,65 +738,6 @@ app.post('/extract-last-frame', async (req, res) => {
   }
 });
 
-// ─── VOICE-MERGE (replace Seedance silent audio with Google TTS) ──────────
-// Body: { video_url, audio_url, job_id }
-//   video_url : silent Seedance MP4
-//   audio_url : Google TTS output (WAV / MP3 / M4A)
-// Replaces the video's audio track entirely with the TTS voice.
-// -shortest trims audio to video length so nothing hangs.
-// Status via /status/:job_id.
-app.post('/voice-merge', async (req, res) => {
-  const { video_url, audio_url, job_id } = req.body || {};
-  if (!video_url || !audio_url) {
-    return res.status(400).json({ error: 'video_url and audio_url required' });
-  }
-  console.log(`[${job_id}] voice-merge started`);
-  setJob(job_id, { status: 'processing' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-vm-'));
-
-  try {
-    await updateJob(job_id, 'downloading');
-    res.json({ status: 'processing', job_id, message: 'voice-merge started' });
-
-    const vPath = path.join(tmpDir, 'video.mp4');
-    const aExt = String(audio_url).match(/\.(mp3|wav|m4a|aac|ogg)(\?|$)/i) ? RegExp.$1 : 'mp3';
-    const aPath = path.join(tmpDir, 'audio.' + aExt);
-    await downloadFile(video_url, vPath);
-    await downloadFile(audio_url, aPath);
-
-    await updateJob(job_id, 'merging');
-    const outPath = path.join(tmpDir, 'out.mp4');
-
-    await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(vPath)
-        .input(aPath)
-        .outputOptions([
-          '-map', '0:v',        // video from Seedance clip
-          '-map', '1:a',        // audio from Google TTS
-          '-c:v', 'copy',       // no re-encode — fast + lossless
-          '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
-          '-shortest',          // stop at video end (TTS may be slightly shorter/longer)
-          '-movflags', '+faststart'
-        ])
-        .output(outPath)
-        .on('end', resolve)
-        .on('error', (err) => reject(new Error('voice-merge ffmpeg error: ' + err.message)))
-        .run();
-    });
-
-    await updateJob(job_id, 'uploading');
-    const publicUrl = await uploadOutput(job_id, outPath);
-    await updateJob(job_id, 'done', publicUrl);
-    console.log(`[${job_id}] voice-merge done — ${publicUrl}`);
-  } catch (err) {
-    console.error(`[${job_id}] voice-merge error:`, err.message);
-    await updateJob(job_id, 'error', null, err.message);
-  } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
-  }
-});
-
 // ─── HELPERS ─────────────────────────────────────────────────
 
 async function mixMusic(videoPath, audioPath, outPath, opts) {
@@ -717,18 +823,29 @@ function buildAss(cues, opts) {
   const shadow   = (st.shadow  != null) ? st.shadow  : 1;
   const marginV  = st.marginV || 40;
   const bold     = st.bold === false ? 0 : -1;
+  // ASS numpad-style alignment: 8=top-center, 5=middle-center, 2=bottom-center.
+  // This was previously hardcoded to 2 — st.align (top/middle/bottom, sent
+  // correctly by the frontend's position buttons) was never actually read,
+  // so every caption rendered at the bottom regardless of which button was
+  // pressed.
+  const alignMap = { top: 8, middle: 5, center: 5, bottom: 2 };
+  const alignNum = alignMap[String(st.align || 'bottom').toLowerCase()] || 2;
+  // Real video dimensions, probed by the caller — falls back to the old
+  // 1280x720 only if probing somehow failed, never silently mismatched.
+  const resW = opts.resW || 1280;
+  const resH = opts.resH || 720;
 
   const header =
     '[Script Info]\n' +
     'ScriptType: v4.00+\n' +
-    'PlayResX: 1280\n' +
-    'PlayResY: 720\n' +
+    'PlayResX: ' + resW + '\n' +
+    'PlayResY: ' + resH + '\n' +
     'WrapStyle: 2\n' +
     'ScaledBorderAndShadow: yes\n\n' +
     '[V4+ Styles]\n' +
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n' +
     'Style: Default,' + fontName + ',' + fontSize + ',' + primary + ',&H000000FF,' + outline + ',&H64000000,' +
-      bold + ',0,0,0,100,100,0,0,1,' + outlineW + ',' + shadow + ',2,40,40,' + marginV + ',1\n\n' +
+      bold + ',0,0,0,100,100,0,0,1,' + outlineW + ',' + shadow + ',' + alignNum + ',40,40,' + marginV + ',1\n\n' +
     '[Events]\n' +
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
 
