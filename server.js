@@ -69,6 +69,44 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// ── EDIT-CREDIT RECEIPTS ──────────────────────────────────────
+// requireAuth above proves IDENTITY, not PAYMENT — /caption and /music are
+// supposed to be gated by edit credits, but that spend happens as a
+// completely separate call to edit-credits.js (Netlify) with nothing
+// linking it to this call. That meant ANY verified user, including one
+// with zero edit credits who never bought anything, could call these
+// endpoints directly and get the real ffmpeg work done for free. Same
+// signing scheme as edit-credits.js's spend receipts (same
+// USER_SESSION_SECRET) — requireReceipt verifies a real, recent, matching
+// spend actually happened before any download/ffmpeg work starts.
+const RECEIPT_TTL_MS = 30 * 60 * 1000;
+function verifyReceipt(receipt) {
+  try {
+    const key = sessionSecret();
+    if (!key || !receipt) return null;
+    const dot = String(receipt).lastIndexOf('.');
+    if (dot < 0) return null;
+    const p = receipt.slice(0, dot), sig = receipt.slice(dot + 1);
+    const expSig = crypto.createHmac('sha256', key).update(p).digest('base64');
+    if (sig.length !== expSig.length) return null;
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expSig))) return null;
+    const obj = JSON.parse(Buffer.from(p, 'base64').toString());
+    if (!obj.iat || Date.now() - obj.iat > RECEIPT_TTL_MS) return null;
+    return obj;
+  } catch (e) { return null; }
+}
+function requireReceipt(expectedReasons) {
+  const allowed = Array.isArray(expectedReasons) ? expectedReasons : [expectedReasons];
+  return function (req, res, next) {
+    const auth = req.tahAuth;
+    const claim = verifyReceipt(req.body && req.body.receipt);
+    if (!claim || claim.email !== auth.email || allowed.indexOf(claim.reason) === -1) {
+      return res.status(402).json({ error: 'invalid_receipt', message: 'No matching recent edit-credit charge found for this action.' });
+    }
+    next();
+  };
+}
+
 // Supabase (optional — only used as a fallback; primary storage is R2).
 // Wrapped in try/catch and a URL sanity check so a malformed SUPABASE_URL
 // can NEVER take the whole server down at boot (this was crashing Railway
@@ -215,7 +253,7 @@ app.post('/merge', requireAuth, async (req, res) => {
 // Body: { video_url, cues:[{start,end,text}], job_id, rtl?, style? }
 //   start/end in seconds. Burns ASS subtitles into the MP4 (permanent),
 //   so captions survive download and sharing. Status via /status/:job_id.
-app.post('/caption', requireAuth, async (req, res) => {
+app.post('/caption', requireAuth, requireReceipt('captions'), async (req, res) => {
   const { video_url, cues, job_id, rtl, style } = req.body || {};
   if (!video_url || !Array.isArray(cues) || cues.length === 0) {
     return res.status(400).json({ error: 'video_url and non-empty cues[] required' });
@@ -292,7 +330,7 @@ app.post('/finalize', requireAuth, async (req, res) => {
 //   duck:   true → auto-lower music under any speech (default true)
 // Loops the track to fill the video, ducks under speech, fades out the
 // tail, and keeps any original voice. Status via /status/:job_id.
-app.post('/music', requireAuth, async (req, res) => {
+app.post('/music', requireAuth, requireReceipt(['music', 'voice']), async (req, res) => {
   const { video_url, audio_url, job_id } = req.body || {};
   const volume = Math.min(Math.max(parseFloat(req.body && req.body.volume) || 0.35, 0), 1);
   const duck = (req.body && req.body.duck === false) ? false : true;
