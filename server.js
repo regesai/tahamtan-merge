@@ -11,10 +11,63 @@ const fetch   = require('node-fetch');
 const fs      = require('fs');
 const path    = require('path');
 const os      = require('os');
+const crypto  = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+// ── IDENTITY VERIFICATION ─────────────────────────────────────
+// This is a SEPARATE deployment (Railway) from the Netlify functions, so it
+// can't require('./auth.js') — that file lives in a different repo. This is
+// the same HMAC-signed-token technique duplicated here on purpose: same
+// USER_SESSION_SECRET env var, same verify logic, so a token issued by
+// verify-otp.js (Netlify) is valid here too. Previously NONE of /merge,
+// /caption, /finalize, /music checked identity at all — every real ffmpeg
+// job (actual CPU cost, not just a database row) was completely open to
+// anyone who read MERGE_SERVICE_URL out of the page's own JS. Fail closed:
+// any doubt = not authenticated.
+function sessionSecret() {
+  return process.env.USER_SESSION_SECRET || process.env.STAFF_SESSION_SECRET || '';
+}
+function b64urlDecode(str) {
+  return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString();
+}
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function verifyToken(token) {
+  try {
+    const key = sessionSecret();
+    if (!key || !token) return { ok: false, owner: false };
+    const t = String(token).replace(/^Bearer\s+/i, '');
+    const dot = t.lastIndexOf('.');
+    if (dot < 0) return { ok: false, owner: false };
+    const p = t.slice(0, dot), sig = t.slice(dot + 1);
+    const expSig = b64url(crypto.createHmac('sha256', key).update(p).digest());
+    if (sig.length !== expSig.length) return { ok: false, owner: false };
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expSig))) return { ok: false, owner: false };
+    const payload = JSON.parse(b64urlDecode(p));
+    if (!payload.email || !payload.exp || Date.now() >= payload.exp) return { ok: false, owner: false };
+    return { ok: true, email: payload.email, owner: payload.o === 1 };
+  } catch (e) {
+    return { ok: false, owner: false };
+  }
+}
+// Pulls a token from the Authorization header or the JSON body (token /
+// session_token) — same precedence as auth.js's authFromEvent.
+function authFromReq(req) {
+  const hdr = (req.headers && (req.headers.authorization || req.headers.Authorization)) || '';
+  const bodyTok = req.body && (req.body.token || req.body.session_token);
+  return verifyToken(hdr || bodyTok || '');
+}
+// Express middleware — reject before any download/ffmpeg work starts.
+function requireAuth(req, res, next) {
+  const auth = authFromReq(req);
+  if (!auth.ok) return res.status(401).json({ error: 'not_verified', message: 'Please verify your email first.' });
+  req.tahAuth = auth;
+  next();
+}
 
 // Supabase (optional — only used as a fallback; primary storage is R2).
 // Wrapped in try/catch and a URL sanity check so a malformed SUPABASE_URL
@@ -78,6 +131,10 @@ app.get('/status/:job_id', (req, res) => {
 });
 
 // ─── PROXY (for CORS issues with Atlas video URLs) ───────────
+// NOTE: still unauthenticated — used directly as a <video src>, which
+// can't carry an Authorization header or JSON body. Gating this properly
+// needs a short-lived signed query-param token instead; flagged as a
+// separate, still-open item, not fixed in this pass.
 app.get('/proxy', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'url param required' });
@@ -93,7 +150,7 @@ app.get('/proxy', async (req, res) => {
 });
 
 // ─── MERGE ───────────────────────────────────────────────────
-app.post('/merge', async (req, res) => {
+app.post('/merge', requireAuth, async (req, res) => {
   const { clips, job_id } = req.body;
 
   if (!clips || !Array.isArray(clips) || clips.length < 2) {
@@ -158,7 +215,7 @@ app.post('/merge', async (req, res) => {
 // Body: { video_url, cues:[{start,end,text}], job_id, rtl?, style? }
 //   start/end in seconds. Burns ASS subtitles into the MP4 (permanent),
 //   so captions survive download and sharing. Status via /status/:job_id.
-app.post('/caption', async (req, res) => {
+app.post('/caption', requireAuth, async (req, res) => {
   const { video_url, cues, job_id, rtl, style } = req.body || {};
   if (!video_url || !Array.isArray(cues) || cues.length === 0) {
     return res.status(400).json({ error: 'video_url and non-empty cues[] required' });
@@ -198,7 +255,7 @@ app.post('/caption', async (req, res) => {
 // Re-wraps the video as a clean 1080x1920 H.264/AAC file with BT.709
 // color and a healthy bitrate, plus a light brightness/shadow/saturation
 // lift so it survives TikTok/Reels/Shorts compression without darkening.
-app.post('/finalize', async (req, res) => {
+app.post('/finalize', requireAuth, async (req, res) => {
   const { video_url, job_id } = req.body || {};
   const boost = (req.body && req.body.boost === false) ? false : true;
   if (!video_url) return res.status(400).json({ error: 'video_url required' });
@@ -235,7 +292,7 @@ app.post('/finalize', async (req, res) => {
 //   duck:   true → auto-lower music under any speech (default true)
 // Loops the track to fill the video, ducks under speech, fades out the
 // tail, and keeps any original voice. Status via /status/:job_id.
-app.post('/music', async (req, res) => {
+app.post('/music', requireAuth, async (req, res) => {
   const { video_url, audio_url, job_id } = req.body || {};
   const volume = Math.min(Math.max(parseFloat(req.body && req.body.volume) || 0.35, 0), 1);
   const duck = (req.body && req.body.duck === false) ? false : true;
@@ -491,18 +548,6 @@ function mergeVideos(listFile, outputFile) {
   });
 }
 
-// Probe a clip for duration + whether it carries an audio track
-function probeClip(file) {
-  return new Promise((resolve) => {
-    ffmpeg.ffprobe(file, (err, data) => {
-      if (err || !data) return resolve({ duration: 0, hasAudio: false });
-      const duration = data.format && data.format.duration ? parseFloat(data.format.duration) : 0;
-      const hasAudio = (data.streams || []).some((s) => s.codec_type === 'audio');
-      resolve({ duration: duration || 0, hasAudio });
-    });
-  });
-}
-
 // Smooth merge: crossfade (dissolve) ~0.75s between clips so the joins
 // aren't hard cuts. Re-encodes (xfade can't stream-copy). Falls back to
 // plain concat upstream if this throws.
@@ -552,6 +597,18 @@ async function mergeVideosSmooth(files, outputFile) {
       .on('end', resolve)
       .on('error', (err) => reject(new Error('xfade ffmpeg error: ' + err.message)))
       .run();
+  });
+}
+
+// Probe a clip for duration + whether it carries an audio track
+function probeClip(file) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(file, (err, data) => {
+      if (err || !data) return resolve({ duration: 0, hasAudio: false });
+      const duration = data.format && data.format.duration ? parseFloat(data.format.duration) : 0;
+      const hasAudio = (data.streams || []).some((s) => s.codec_type === 'audio');
+      resolve({ duration: duration || 0, hasAudio });
+    });
   });
 }
 
