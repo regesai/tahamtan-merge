@@ -95,6 +95,70 @@ function verifyReceipt(receipt) {
     return obj;
   } catch (e) { return null; }
 }
+// ── PAID-PLAN VERIFICATION ────────────────────────────────────
+// For features that should be paid-plan-only, not just edit-credit-
+// gated (e.g. /finalize's boost path) — a free-trial user has no edit
+// credits to spend in the first place, so a credit charge alone doesn't
+// stop them; this checks there's an actual valid, non-expired plan code
+// behind the request. Independent of the optional `supabase` client
+// above (that one is nullable and documented as fallback-only) — this
+// does its own direct REST lookup so it works whether or not that
+// client initialized. FAILS CLOSED: any doubt (no code, lookup error,
+// expired code) = not a paid plan.
+//
+// REQUIRES a Supabase key with read access to activation_codes. Prefers
+// SUPABASE_SERVICE_ROLE_KEY (same convention entitlement.js uses on
+// Netlify) over the plain SUPABASE_KEY already set here for the
+// merge_jobs fallback — that one may be a weaker anon key blocked by
+// RLS from reading activation_codes. Set SUPABASE_SERVICE_ROLE_KEY on
+// Railway for this to work reliably.
+const CODE_VALID_DAYS = 30; // mirrors entitlement.js's own expiry window
+async function isPaidPlanCode(code) {
+  if (!code) return false;
+  const supaUrl = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+  const supaKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || '';
+  if (!/^https:\/\/.+/.test(supaUrl) || !supaKey) {
+    console.warn('isPaidPlanCode: Supabase not configured on Railway — failing closed');
+    return false;
+  }
+  try {
+    const res = await fetch(
+      supaUrl + '/rest/v1/activation_codes?code=eq.' + encodeURIComponent(String(code).toUpperCase()) + '&select=plan,created_at,used_at&limit=1',
+      { headers: { apikey: supaKey, Authorization: 'Bearer ' + supaKey } }
+    );
+    if (!res.ok) { console.warn('isPaidPlanCode: lookup failed', res.status); return false; }
+    const rows = await res.json();
+    const row = Array.isArray(rows) && rows[0];
+    if (!row || !row.plan) return false;
+    const startedAt = row.used_at || row.created_at;
+    if (startedAt) {
+      const ageDays = (Date.now() - new Date(startedAt).getTime()) / 86400000;
+      if (ageDays > CODE_VALID_DAYS) return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn('isPaidPlanCode error:', e.message);
+    return false;
+  }
+}
+function requirePaidPlan(req, res, next) {
+  isPaidPlanCode(req.body && req.body.code).then(ok => {
+    if (!ok) return res.status(402).json({ error: 'paid_plan_required', message: 'This feature needs an active paid plan.' });
+    next();
+  });
+}
+
+// /finalize is called TWO ways: boost:true (the user-facing "Optimize for
+// Social / HD ready" button — should be paid-plan-only, since a free user
+// could otherwise click it repeatedly and duplicate R2 storage for free)
+// and boost:false+watermark:true (the automatic pass every free video
+// gets right after generation — must stay open to free users, it's how
+// their videos get the TAHAMTAN watermark burned in at all).
+function requirePaidPlanIfBoost(req, res, next) {
+  if (req.body && req.body.boost === true) return requirePaidPlan(req, res, next);
+  next();
+}
+
 function requireReceipt(expectedReasons) {
   const allowed = Array.isArray(expectedReasons) ? expectedReasons : [expectedReasons];
   return function (req, res, next) {
@@ -293,7 +357,7 @@ app.post('/caption', requireAuth, requireReceipt('captions'), async (req, res) =
 // Re-wraps the video as a clean 1080x1920 H.264/AAC file with BT.709
 // color and a healthy bitrate, plus a light brightness/shadow/saturation
 // lift so it survives TikTok/Reels/Shorts compression without darkening.
-app.post('/finalize', requireAuth, async (req, res) => {
+app.post('/finalize', requireAuth, requirePaidPlanIfBoost, async (req, res) => {
   const { video_url, job_id } = req.body || {};
   const boost = (req.body && req.body.boost === false) ? false : true;
   if (!video_url) return res.status(400).json({ error: 'video_url required' });
