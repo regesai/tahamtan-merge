@@ -430,6 +430,456 @@ app.post('/music', requireAuth, requireReceipt(['music', 'voice']), async (req, 
   }
 });
 
+
+// ═══════════════════════════════════════════════════════════════════════
+// RESTORED 20 Oct 2026 — the 30 September regression
+//
+// On 30 Sep (commit c0ea6db) server.js was cut from 1273 lines to 229 and
+// then rebuilt to 821 — but only 7 of the original 22 routes came back.
+// Fifteen were lost silently. index.html never stopped calling six of
+// them, so for three weeks every one of those POSTs hit Express's default
+// 404 handler.
+//
+// /voice-merge is the one that hurt: it is the ffmpeg step that lays the
+// Google TTS audio onto the Seedance clip. The frontend does
+// `if (vmR.ok) { ... }` with NO else branch, so a 404 there produced a
+// SILENT VIDEO with no error logged and nothing shown to the customer.
+// Every bit of voice work done since 30 Sep was being thrown away at the
+// last step.
+//
+// Restored verbatim from commit 3e86bfe (24 Sep), the last good version.
+// CHANGED ON RESTORE: each route now carries requireAuth, matching the
+// security model added to /merge, /caption, /finalize and /music after
+// these were lost. That is safe because index.html's global fetch wrapper
+// injects `token` into the body of every request to this host (see
+// window.__paidEndpoints), so a verified user passes automatically.
+//
+// NOT added: requireReceipt. /caption and /music charge edit credits that
+// way, and most of the editor routes below probably should too — but the
+// reason-strings the frontend sends are unverified, and a wrong one would
+// 402 every call. Decide that deliberately rather than guess here.
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── VOICE-MERGE (replace Seedance silent audio with Google TTS) ──────────
+// Body: { video_url, audio_url, job_id }
+//   video_url : silent Seedance MP4
+//   audio_url : Google TTS output (WAV / MP3 / M4A)
+// Replaces the video's audio track entirely with the TTS voice.
+// -shortest trims audio to video length so nothing hangs.
+// Status via /status/:job_id.
+app.post('/voice-merge', requireAuth, async (req, res) => {
+  const { video_url, audio_url, job_id } = req.body || {};
+  if (!video_url || !audio_url) {
+    return res.status(400).json({ error: 'video_url and audio_url required' });
+  }
+  console.log(`[${job_id}] voice-merge started`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-vm-'));
+
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'voice-merge started' });
+
+    const vPath = path.join(tmpDir, 'video.mp4');
+    const aExt = String(audio_url).match(/\.(mp3|wav|m4a|aac|ogg)(\?|$)/i) ? RegExp.$1 : 'mp3';
+    const aPath = path.join(tmpDir, 'audio.' + aExt);
+    await downloadFile(video_url, vPath);
+    await downloadFile(audio_url, aPath);
+
+    await updateJob(job_id, 'merging');
+    const outPath = path.join(tmpDir, 'out.mp4');
+
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(vPath)
+        .input(aPath)
+        .outputOptions([
+          '-map', '0:v',        // video from Seedance clip
+          '-map', '1:a',        // audio from Google TTS
+          '-c:v', 'copy',       // no re-encode — fast + lossless
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+          '-shortest',          // stop at video end (TTS may be slightly shorter/longer)
+          '-movflags', '+faststart'
+        ])
+        .output(outPath)
+        .on('end', resolve)
+        .on('error', (err) => reject(new Error('voice-merge ffmpeg error: ' + err.message)))
+        .run();
+    });
+
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] voice-merge done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] voice-merge error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+// ─── LIP-SYNC (Wav2Lip via Replicate) ─────────────────────────
+// Makes the video's mouth movements match the given audio — used for the
+// 11 languages that don't get Native Audio (everything except English and
+// Chinese, which Seedance already handles natively). Wav2Lip works purely
+// off the audio waveform, not language understanding, so it needs zero
+// per-language configuration — one endpoint covers all 11 automatically.
+//
+// Body: { video_url, audio_url, job_id }
+// Cost: ~$0.005-0.016 per run on Replicate's GPU — negligible against plan margins.
+//
+// REQUIRED env vars:
+//   REPLICATE_API_TOKEN     — from replicate.com/account/api-tokens
+//   REPLICATE_WAV2LIP_MODEL — "owner/name:versionhash", e.g.
+//     "devxpy/cog-wav2lip:3ee...". Copy the current version hash from the
+//     model's page on replicate.com (Docs/API tab) — community models
+//     (not Replicate's own "official" models) require this exact pinned
+//     version, not just the bare owner/name.
+app.post('/lip-sync', requireAuth, async (req, res) => {
+  const { video_url, audio_url, job_id } = req.body || {};
+  if (!video_url || !audio_url) {
+    return res.status(400).json({ error: 'video_url and audio_url required' });
+  }
+  const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
+  const REPLICATE_MODEL = process.env.REPLICATE_WAV2LIP_MODEL; // "owner/name:version"
+  if (!REPLICATE_TOKEN || !REPLICATE_MODEL) {
+    return res.status(500).json({ error: 'Lip-sync not configured — set REPLICATE_API_TOKEN and REPLICATE_WAV2LIP_MODEL' });
+  }
+
+  console.log(`[${job_id}] lip-sync started`);
+  setJob(job_id, { status: 'processing' });
+
+  try {
+    await updateJob(job_id, 'syncing');
+    res.json({ status: 'processing', job_id, message: 'lip-sync started' });
+
+    const version = REPLICATE_MODEL.includes(':') ? REPLICATE_MODEL.split(':')[1] : null;
+    if (!version) throw new Error('REPLICATE_WAV2LIP_MODEL must include a version hash, e.g. "owner/name:abc123..."');
+
+    // Create the prediction — Replicate runs this async, we poll for completion.
+    const createRes = await fetch('https://api.replicate.com/v1/predictions', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + REPLICATE_TOKEN,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        version: version,
+        input: { face: video_url, audio: audio_url }
+      })
+    });
+    if (!createRes.ok) {
+      const t = await createRes.text().catch(() => '');
+      throw new Error('Replicate create failed: ' + createRes.status + ' ' + t.slice(0, 300));
+    }
+    let prediction = await createRes.json();
+
+    // Poll until done. Wav2Lip typically completes in 6-7 seconds on
+    // Replicate's GPU, but allow a generous ceiling in case of queueing.
+    const started = Date.now();
+    const TIMEOUT_MS = 5 * 60 * 1000;
+    while (!['succeeded', 'failed', 'canceled'].includes(prediction.status)) {
+      if (Date.now() - started > TIMEOUT_MS) throw new Error('lip-sync timed out after 5 minutes');
+      await new Promise((r) => setTimeout(r, 2000));
+      const pollRes = await fetch('https://api.replicate.com/v1/predictions/' + prediction.id, {
+        headers: { 'Authorization': 'Bearer ' + REPLICATE_TOKEN }
+      });
+      prediction = await pollRes.json();
+    }
+    if (prediction.status !== 'succeeded') {
+      throw new Error('Replicate lip-sync failed: ' + (prediction.error || 'unknown error'));
+    }
+
+    const resultUrl = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+    if (!resultUrl) throw new Error('Replicate returned no output URL');
+
+    // Download Replicate's result and re-upload to our own storage, so the
+    // final URL is on our own domain like every other endpoint's output —
+    // Replicate's own hosted URLs are not guaranteed to stay available long-term.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-lip-'));
+    try {
+      const outPath = path.join(tmpDir, 'out.mp4');
+      await downloadFile(resultUrl, outPath);
+      await updateJob(job_id, 'uploading');
+      const publicUrl = await uploadOutput(job_id, outPath);
+      await updateJob(job_id, 'done', publicUrl);
+      console.log(`[${job_id}] lip-sync done — ${publicUrl}`);
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+    }
+  } catch (err) {
+    console.error(`[${job_id}] lip-sync error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  }
+});
+
+// ─── TRIM ────────────────────────────────────────────────────
+app.post('/trim', requireAuth, (req, res) => runVideoJob(req, res, 'trim', async (inPath, outPath, b) => {
+  const start = Math.max(0, parseFloat(b.start) || 0);
+  const end = parseFloat(b.end) || 0;
+  const dur = Math.max(0.1, end - start);
+  await new Promise((resolve, reject) => {
+    ffmpeg().input(inPath).setStartTime(start).duration(dur)
+      .outputOptions(['-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-c:a aac', '-b:a 192k', '-movflags +faststart'])
+      .output(outPath).on('end', resolve)
+      .on('error', (e) => reject(new Error('trim ffmpeg error: ' + e.message))).run();
+  });
+}));
+
+// ─── SPEED ───────────────────────────────────────────────────
+app.post('/speed', requireAuth, (req, res) => runVideoJob(req, res, 'speed', async (inPath, outPath, b) => {
+  let rate = parseFloat(b.rate) || 1;
+  rate = Math.min(Math.max(rate, 0.25), 4);
+  const probe = await probeClip(inPath);
+  const vpts = (1 / rate).toFixed(5);
+  function atempoChain(r) {
+    const parts = []; let x = r;
+    while (x > 2.0) { parts.push('atempo=2.0'); x /= 2.0; }
+    while (x < 0.5) { parts.push('atempo=0.5'); x /= 0.5; }
+    parts.push('atempo=' + x.toFixed(5));
+    return parts.join(',');
+  }
+  if (probe.hasAudio) {
+    await runFF(inPath, outPath, {
+      complex: `[0:v]setpts=${vpts}*PTS[v];[0:a]${atempoChain(rate)}[a]`,
+      maps: ['v', 'a'], audio: 'encode', tag: 'speed'
+    });
+  } else {
+    await runFF(inPath, outPath, { vf: `setpts=${vpts}*PTS`, audio: 'drop', tag: 'speed' });
+  }
+}));
+
+// ─── VOLUME ──────────────────────────────────────────────────
+app.post('/volume', requireAuth, (req, res) => runVideoJob(req, res, 'volume', async (inPath, outPath, b) => {
+  const vol = Math.min(Math.max(parseFloat(b.volume), 0), 3);
+  const probe = await probeClip(inPath);
+  if (!probe.hasAudio) { await runFF(inPath, outPath, { audio: 'drop', tag: 'volume' }); return; }
+  await runFF(inPath, outPath, { af: 'volume=' + (isNaN(vol) ? 1 : vol), tag: 'volume' });
+}));
+
+// ─── FILTER ──────────────────────────────────────────────────
+app.post('/filter', requireAuth, (req, res) => runVideoJob(req, res, 'filter', async (inPath, outPath, b) => {
+  const p = String(b.preset || '').toLowerCase();
+  const map = {
+    vivid:  'eq=saturation=1.45:contrast=1.12:brightness=0.02',
+    warm:   "curves=r='0/0.06 1/1':b='0/0 1/0.94',eq=saturation=1.1",
+    cool:   "curves=b='0/0.06 1/1':r='0/0 1/0.94',eq=saturation=1.05",
+    cinema: "eq=contrast=1.12:saturation=0.92,curves=r='0/0.03 0.5/0.5 1/0.97':b='0/0.04 0.5/0.5 1/0.95'",
+    bw:     'hue=s=0,eq=contrast=1.1',
+    bright: 'eq=brightness=0.09:saturation=1.06:contrast=1.03'
+  };
+  const vf = map[p] || map.vivid;
+  await runFF(inPath, outPath, { vf, tag: 'filter' });
+}));
+
+// ─── EFFECT ──────────────────────────────────────────────────
+app.post('/effect', requireAuth, (req, res) => runVideoJob(req, res, 'effect', async (inPath, outPath, b) => {
+  const e = String(b.effect || '').toLowerCase();
+  const bloom = (sigma, op, pre) =>
+    ({ complex: `[0:v]${pre || 'null'}[base];[base]split[a][b];[b]gblur=sigma=${sigma}[bl];[a][bl]blend=all_mode=screen:all_opacity=${op}[v]`, maps: ['v'] });
+  let opts;
+  switch (e) {
+    case 'glow':      opts = bloom(9, 0.35, 'eq=brightness=0.03:saturation=1.05'); break;
+    case 'warm_glow': opts = bloom(9, 0.35, "curves=r='0/0.06 1/1':b='0/0 1/0.94',eq=saturation=1.08"); break;
+    case 'dream':     opts = bloom(4, 0.45, 'eq=saturation=1.1:brightness=0.03'); break;
+    case 'sparkle':   opts = bloom(6, 0.3,  'eq=brightness=0.05:saturation=1.15:contrast=1.05'); break;
+    case 'vhs':       opts = { vf: "noise=c0s=26:allf=t,eq=saturation=1.25:contrast=1.05,curves=r='0/0.03 1/1'" }; break;
+    case 'vignette':  opts = { vf: 'vignette=PI/4' }; break;
+    default:          opts = bloom(9, 0.35, 'eq=brightness=0.03:saturation=1.05');
+  }
+  opts.tag = 'effect';
+  await runFF(inPath, outPath, opts);
+}));
+
+// ─── REFRAME ─────────────────────────────────────────────────
+app.post('/reframe', requireAuth, (req, res) => runVideoJob(req, res, 'reframe', async (inPath, outPath, b) => {
+  const dims = aspectDims(b.aspect);
+  const vf = `scale=${dims.w}:${dims.h}:force_original_aspect_ratio=decrease,` +
+             `pad=${dims.w}:${dims.h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p`;
+  await runFF(inPath, outPath, { vf, tag: 'reframe' });
+}));
+
+// ─── FADE ────────────────────────────────────────────────────
+app.post('/fade', requireAuth, (req, res) => runVideoJob(req, res, 'fade', async (inPath, outPath, b) => {
+  const f = Math.min(Math.max(parseFloat(b.fade) || 1, 0.2), 5);
+  const probe = await probeClip(inPath);
+  const dur = probe.duration || 0;
+  const outSt = Math.max(0, dur - f).toFixed(2);
+  const vf = `fade=t=in:st=0:d=${f},fade=t=out:st=${outSt}:d=${f}`;
+  if (probe.hasAudio && dur) {
+    await runFF(inPath, outPath, {
+      complex: `[0:v]${vf}[v];[0:a]afade=t=in:st=0:d=${f},afade=t=out:st=${outSt}:d=${f}[a]`,
+      maps: ['v', 'a'], audio: 'encode', tag: 'fade'
+    });
+  } else {
+    await runFF(inPath, outPath, { vf, audio: probe.hasAudio ? 'copy' : 'drop', tag: 'fade' });
+  }
+}));
+
+// ─── TEXT ────────────────────────────────────────────────────
+app.post('/text', requireAuth, (req, res) => runVideoJob(req, res, 'text', async (inPath, outPath, b, tmpDir) => {
+  const text = String(b.text || '').trim();
+  if (!text) throw new Error('text required');
+  const probe = await probeClip(inPath);
+  const dur = probe.duration || 5;
+  const assPath = path.join(tmpDir, 'text.ass');
+  fs.writeFileSync(assPath, buildTitleAss(text, {
+    pos: b.pos || 'bottom', lang: b.lang || '', dur: dur,
+    rtl: /^(fa|ar|ur)$/i.test(String(b.lang || ''))
+  }));
+  await burnSubtitles(inPath, assPath, outPath, tmpDir);
+}));
+
+// ─── STICKER ─────────────────────────────────────────────────
+app.post('/sticker', requireAuth, (req, res) => runVideoJob(req, res, 'sticker', async (inPath, outPath, b, tmpDir) => {
+  const emoji = String(b.emoji || '🔥');
+  const size = Math.min(Math.max(parseInt(b.size, 10) || 160, 40), 400);
+  const pos = String(b.pos || 'br');
+  const M = 40;
+  const posMap = {
+    br: `x=w-tw-${M}:y=h-th-${M}`, bl: `x=${M}:y=h-th-${M}`,
+    tr: `x=w-tw-${M}:y=${M}`,       tl: `x=${M}:y=${M}`,
+    center: 'x=(w-tw)/2:y=(h-th)/2'
+  };
+  const xy = posMap[pos] || posMap.br;
+  const fontFile = process.env.EMOJI_FONT || '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf';
+  const txtPath = path.join(tmpDir, 'sticker.txt');
+  fs.writeFileSync(txtPath, emoji, 'utf8');
+  const esc = txtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+  const fesc = fontFile.replace(/\\/g, '/').replace(/:/g, '\\:');
+  const vf = `drawtext=fontfile='${fesc}':textfile='${esc}':fontsize=${size}:${xy}`;
+  await runFF(inPath, outPath, { vf, tag: 'sticker' });
+}));
+
+// ─── FREEZE ──────────────────────────────────────────────────
+app.post('/freeze', requireAuth, (req, res) => runVideoJob(req, res, 'freeze', async (inPath, outPath, b, tmpDir) => {
+  const at = Math.max(0, parseFloat(b.at) || 0);
+  const hold = Math.min(Math.max(parseFloat(b.hold) || 1.5, 0.3), 10);
+  await freezeFrame(inPath, outPath, at, hold, tmpDir);
+}));
+
+// ─── PHOTO-VIDEO ─────────────────────────────────────────────
+app.post('/photo-video', requireAuth, async (req, res) => {
+  const b = req.body || {};
+  const images = b.images;
+  const job_id = b.job_id;
+  if (!Array.isArray(images) || images.length === 0) {
+    return res.status(400).json({ error: 'images[] required' });
+  }
+  console.log(`[${job_id}] photo-video — ${images.length} images`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-p2v-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'photo-video started' });
+    const dims = aspectDims(b.aspect);
+    const per = Math.min(Math.max(parseFloat(b.perImage) || 3, 1.5), 8);
+    const clips = [];
+    for (let i = 0; i < images.length && i < 9; i++) {
+      const img = path.join(tmpDir, `img_${i}` + (String(images[i]).match(/\.(png|webp|jpe?g)(\?|$)/i) ? '.' + RegExp.$1 : '.jpg'));
+      await downloadFile(images[i], img);
+      const clip = path.join(tmpDir, `clip_${i}.mp4`);
+      await kenBurnsClip(img, clip, per, dims, i);
+      clips.push(clip);
+    }
+    await updateJob(job_id, 'building');
+    const outPath = path.join(tmpDir, 'out.mp4');
+    if (clips.length === 1) {
+      fs.copyFileSync(clips[0], outPath);
+    } else if (String(b.transition) === 'fade') {
+      try { await mergeVideosSmooth(clips, outPath); }
+      catch (e) {
+        const listFile = path.join(tmpDir, 'list.txt');
+        fs.writeFileSync(listFile, clips.map(f => `file '${f}'`).join('\n'));
+        await mergeVideos(listFile, outPath);
+      }
+    } else {
+      const listFile = path.join(tmpDir, 'list.txt');
+      fs.writeFileSync(listFile, clips.map(f => `file '${f}'`).join('\n'));
+      await mergeVideos(listFile, outPath);
+    }
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] photo-video done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] photo-video error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+// ─── SPLIT-SCREEN ─────────────────────────────────────────────
+app.post('/split-screen', requireAuth, async (req, res) => {
+  const b = req.body || {};
+  const { left_url, right_url, job_id } = b;
+  if (!left_url || !right_url) return res.status(400).json({ error: 'left_url and right_url required' });
+  console.log(`[${job_id}] split-screen — ${b.layout || 'side'}`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-ss-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'split-screen started' });
+    const lPath = path.join(tmpDir, 'left.mp4');
+    const rPath = path.join(tmpDir, 'right.mp4');
+    await downloadFile(left_url, lPath);
+    await downloadFile(right_url, rPath);
+    await updateJob(job_id, 'building');
+    const outPath = path.join(tmpDir, 'out.mp4');
+    await splitScreen(lPath, rPath, outPath, b.layout || 'side', b.aspect || '9:16');
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] split-screen done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] split-screen error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+// ─── EXTRACT-LAST-FRAME ───────────────────────────────────────
+app.post('/extract-last-frame', requireAuth, async (req, res) => {
+  const b = req.body || {};
+  const { video_url, job_id } = b;
+  if (!video_url) return res.status(400).json({ error: 'video_url required' });
+  console.log(`[${job_id}] extract-last-frame started`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-lf-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: 'extract-last-frame started' });
+    const inPath = path.join(tmpDir, 'in.mp4');
+    await downloadFile(video_url, inPath);
+
+    const probe = await probeClip(inPath);
+    const dur = probe.duration || 0;
+    const at = Math.max(0, dur - 0.1);
+    const framePath = path.join(tmpDir, 'lastframe.jpg');
+    await new Promise((resolve, reject) => {
+      ffmpeg().input(inPath).seekInput(at).frames(1)
+        .outputOptions(['-q:v', '2'])
+        .output(framePath)
+        .on('end', resolve)
+        .on('error', (e) => reject(new Error('frame extract: ' + e.message)))
+        .run();
+    });
+
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutputImage(job_id, framePath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] extract-last-frame done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] extract-last-frame error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
 // ─── HELPERS ─────────────────────────────────────────────────
 
 // Mix a looping background track into a video.
@@ -712,6 +1162,198 @@ function probeClip(file) {
       resolve({ duration: duration || 0, hasAudio });
     });
   });
+}
+
+// ── helpers restored alongside the 30 Sep routes (commit 3e86bfe) ──
+function runFF(inPath, outPath, opts) {
+  opts = opts || {};
+  return new Promise((resolve, reject) => {
+    const cmd = ffmpeg().input(inPath);
+    const out = [
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '20',
+      '-movflags', '+faststart'
+    ];
+    if (opts.complex) {
+      cmd.complexFilter(opts.complex, opts.maps || undefined);
+    } else if (opts.vf) {
+      cmd.videoFilters(opts.vf);
+    }
+    if (opts.audio === 'drop') { out.push('-an'); }
+    else if (opts.af) { cmd.audioFilters(opts.af); out.push('-c:a', 'aac', '-b:a', '192k'); }
+    else if (opts.audio === 'encode') { out.push('-c:a', 'aac', '-b:a', '192k'); }
+    else { out.push('-c:a', 'copy'); }
+    if (opts.extraOut) opts.extraOut.forEach(o => out.push(o));
+    cmd.outputOptions(out)
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', (err) => reject(new Error(opts.tag ? (opts.tag + ' ffmpeg error: ' + err.message) : err.message)))
+      .run();
+  });
+}
+
+async function runVideoJob(req, res, tag, runner) {
+  const body = req.body || {};
+  const { video_url, job_id } = body;
+  if (!video_url) return res.status(400).json({ error: 'video_url required' });
+  console.log(`[${job_id}] ${tag} job started`);
+  setJob(job_id, { status: 'processing' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-' + tag + '-'));
+  try {
+    await updateJob(job_id, 'downloading');
+    res.json({ status: 'processing', job_id, message: tag + ' started' });
+    const inPath = path.join(tmpDir, 'in.mp4');
+    await downloadFile(video_url, inPath);
+    await updateJob(job_id, tag);
+    const outPath = path.join(tmpDir, 'out.mp4');
+    await runner(inPath, outPath, body, tmpDir);
+    await updateJob(job_id, 'uploading');
+    const publicUrl = await uploadOutput(job_id, outPath);
+    await updateJob(job_id, 'done', publicUrl);
+    console.log(`[${job_id}] ${tag} done — ${publicUrl}`);
+  } catch (err) {
+    console.error(`[${job_id}] ${tag} error:`, err.message);
+    await updateJob(job_id, 'error', null, err.message);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+function aspectDims(aspect) {
+  switch (String(aspect || '9:16')) {
+    case '1:1':  return { w: 1080, h: 1080 };
+    case '16:9': return { w: 1920, h: 1080 };
+    case '9:16':
+    default:     return { w: 1080, h: 1920 };
+  }
+}
+
+function buildTitleAss(text, opts) {
+  opts = opts || {};
+  const dur = Math.max(0.5, opts.dur || 5);
+  const align = opts.pos === 'top' ? 8 : (opts.pos === 'center' ? 5 : 2);
+  const marginV = opts.pos === 'center' ? 0 : 70;
+  const fontName = fontForLang(opts.lang);
+  let t = String(text).replace(/\r?\n/g, '\\N').replace(/\{/g, '(').replace(/\}/g, ')');
+  if (opts.rtl) t = '\u202B' + t + '\u202C';
+  const header =
+    '[Script Info]\nScriptType: v4.00+\nPlayResX: 1280\nPlayResY: 720\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n' +
+    '[V4+ Styles]\n' +
+    'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n' +
+    'Style: Default,' + fontName + ',30,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,3,1,' +
+      align + ',40,40,' + marginV + ',1\n\n' +
+    '[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
+  return header + 'Dialogue: 0,' + assTime(0) + ',' + assTime(dur) + ',Default,,0,0,0,,' + t + '\n';
+}
+
+async function freezeFrame(inPath, outPath, at, hold, tmpDir) {
+  const probe = await probeClip(inPath);
+  const dur = probe.duration || 0;
+  const hasA = probe.hasAudio;
+  const enc = ['-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-r 30'];
+  const encA = hasA ? ['-c:a aac', '-b:a 192k', '-ar 48000'] : ['-an'];
+  const atC = Math.min(Math.max(at, 0), Math.max(0, dur - 0.05));
+
+  function seg(start, len, out) {
+    return new Promise((resolve, reject) => {
+      const c = ffmpeg().input(inPath).setStartTime(start);
+      if (len) c.duration(len);
+      c.outputOptions(enc.concat(encA)).output(out)
+        .on('end', resolve).on('error', e => reject(new Error('freeze seg: ' + e.message))).run();
+    });
+  }
+  function still(out) {
+    return new Promise((resolve, reject) => {
+      const framePng = path.join(tmpDir, 'frame.png');
+      ffmpeg().input(inPath).seekInput(atC).frames(1).output(framePng)
+        .on('end', () => {
+          const c = ffmpeg().input(framePng).loop(hold).inputOptions(['-framerate 30']);
+          if (hasA) c.input('anullsrc=channel_layout=stereo:sample_rate=48000').inputOptions(['-f lavfi']);
+          const oo = ['-t ' + hold, '-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-r 30', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2'];
+          if (hasA) { oo.push('-c:a aac', '-b:a 192k', '-ar 48000', '-shortest'); } else { oo.push('-an'); }
+          c.outputOptions(oo).output(out)
+            .on('end', resolve).on('error', e => reject(new Error('freeze still: ' + e.message))).run();
+        })
+        .on('error', e => reject(new Error('freeze frame extract: ' + e.message))).run();
+    });
+  }
+
+  const p1 = path.join(tmpDir, 'p1.mp4');
+  const p2 = path.join(tmpDir, 'p2.mp4');
+  const st = path.join(tmpDir, 'still.mp4');
+  const parts = [];
+  if (atC > 0.15) { await seg(0, atC, p1); parts.push(p1); }
+  await still(st); parts.push(st);
+  if (dur - atC > 0.15) { await seg(atC, null, p2); parts.push(p2); }
+
+  const listFile = path.join(tmpDir, 'flist.txt');
+  fs.writeFileSync(listFile, parts.map(f => `file '${f}'`).join('\n'));
+  await mergeVideos(listFile, outPath);
+}
+
+function kenBurnsClip(imgPath, outPath, sec, dims, idx) {
+  const fps = 30;
+  const frames = Math.round(sec * fps);
+  const zoomIn = (idx % 2 === 0);
+  const z = zoomIn
+    ? `z='min(zoom+0.0012,1.2)'`
+    : `z='if(eq(on,1),1.2,max(zoom-0.0012,1.0))'`;
+  const vf =
+    `scale=${dims.w * 2}:${dims.h * 2}:force_original_aspect_ratio=increase,` +
+    `crop=${dims.w * 2}:${dims.h * 2},` +
+    `zoompan=${z}:d=${frames}:s=${dims.w}x${dims.h}:fps=${fps}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',` +
+    `setsar=1,format=yuv420p`;
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(imgPath).loop(sec).inputOptions(['-framerate ' + fps])
+      .videoFilters(vf)
+      .outputOptions(['-t ' + sec, '-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-r ' + fps, '-an'])
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', e => reject(new Error('kenburns ffmpeg error: ' + e.message)))
+      .run();
+  });
+}
+
+async function splitScreen(leftPath, rightPath, outPath, layout, aspect) {
+  const dims = aspectDims(aspect);
+  const side = String(layout) !== 'stack';
+  const paneW = side ? Math.floor(dims.w / 2) : dims.w;
+  const paneH = side ? dims.h : Math.floor(dims.h / 2);
+  const [pl, pr] = await Promise.all([probeClip(leftPath), probeClip(rightPath)]);
+  const bothAudio = pl.hasAudio && pr.hasAudio;
+  const anyAudio = pl.hasAudio || pr.hasAudio;
+  const fit = (i) =>
+    `[${i}:v]scale=${paneW}:${paneH}:force_original_aspect_ratio=increase,crop=${paneW}:${paneH},setsar=1[v${i}]`;
+  const stackFilter = side ? `[v0][v1]hstack=inputs=2[v]` : `[v0][v1]vstack=inputs=2[v]`;
+  let filters = [fit(0), fit(1), stackFilter];
+  const maps = ['v'];
+  let audio = 'drop';
+  if (bothAudio) {
+    filters.push('[0:a][1:a]amix=inputs=2:duration=shortest:dropout_transition=0[a]');
+    maps.push('a'); audio = 'amix';
+  } else if (anyAudio) {
+    const ai = pl.hasAudio ? 0 : 1;
+    maps.push(ai + ':a'); audio = 'single';
+  }
+  await new Promise((resolve, reject) => {
+    const cmd = ffmpeg().input(leftPath).input(rightPath);
+    const out = ['-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-shortest', '-movflags +faststart'];
+    if (audio === 'drop') out.push('-an'); else out.push('-c:a aac', '-b:a 192k');
+    cmd.complexFilter(filters, maps).outputOptions(out).output(outPath)
+      .on('end', resolve)
+      .on('error', e => reject(new Error('split-screen ffmpeg error: ' + e.message)))
+      .run();
+  });
+}
+
+async function uploadOutputImage(job_id, filePath) {
+  if (r2Ready()) return uploadToR2(job_id, filePath, { ext: 'jpg', contentType: 'image/jpeg' });
+  if (!supabase) throw new Error('No output storage configured.');
+  const fileBuffer = fs.readFileSync(filePath);
+  const fileName = `merged/${job_id}-${Date.now()}.jpg`;
+  const { error } = await supabase.storage.from(MERGE_BUCKET).upload(fileName, fileBuffer, { contentType: 'image/jpeg', upsert: true });
+  if (error) throw new Error('Supabase image upload failed: ' + error.message);
+  const { data } = supabase.storage.from(MERGE_BUCKET).getPublicUrl(fileName);
+  return data.publicUrl;
 }
 
 // ─── OUTPUT STORAGE ──────────────────────────────────────────
