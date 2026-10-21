@@ -489,18 +489,107 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
     await updateJob(job_id, 'merging');
     const outPath = path.join(tmpDir, 'out.mp4');
 
+    // ── NOTHING GETS CUT (21 Oct 2026) ─────────────────────────────────
+    // The old command used a bare -shortest, which truncates whichever
+    // stream ends first — and it was wrong in BOTH directions:
+    //
+    //   voice LONGER than video  -> the voiceover was cut off mid-sentence
+    //   voice SHORTER than video -> the VIDEO was cut to the audio length,
+    //                               so a customer paying for 15s got 9s
+    //
+    // Neither is acceptable, and neither needs to happen: both are fixable
+    // here in ffmpeg, on our own box, at no extra cost and with no extra
+    // generation seconds charged to anyone.
+    //
+    //   voice longer  -> LOOP the video to cover the audio. Looping (rather
+    //                    than freezing the last frame) keeps the mouth
+    //                    MOVING for the whole voiceover, which is the entire
+    //                    point of the free lip-sync effect. A frozen face
+    //                    with a voice still talking is the worst option.
+    //   voice shorter -> keep the full video and pad the audio with silence.
+    //
+    // Output length is therefore always max(video, audio). If probing fails
+    // we fall back to the original single-pass behaviour rather than risk
+    // producing nothing.
+    const _vInfo = await probeClip(vPath);
+    const _aInfo = await probeClip(aPath);
+    const _vDur = _vInfo.duration || 0;
+    const _aDur = _aInfo.duration || 0;
+    console.log(`[${job_id}] voice-merge: video ${_vDur.toFixed(2)}s, audio ${_aDur.toFixed(2)}s`);
+
     await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(vPath)
-        .input(aPath)
-        .outputOptions([
-          '-map', '0:v',        // video from Seedance clip
-          '-map', '1:a',        // audio from Google TTS
-          '-c:v', 'copy',       // no re-encode — fast + lossless
+      const cmd = ffmpeg();
+      let outOpts;
+
+      // How to cover a voiceover LONGER than the video depends on what the
+      // video is. Seedance's single-clip ceiling is 15s, so:
+      //
+      //   <= 15s  -> ONE generated clip. Looping it reads as a short motion
+      //              loop and keeps the mouth moving, which is the point.
+      //   >  15s  -> a MERGED seamless sequence with a beginning and an end.
+      //              Replaying its opening to cover extra speech looks
+      //              obviously broken, so hold the final frame instead.
+      //
+      // Either way the voice is spoken in full and the video never shortens.
+      const LOOPABLE_MAX = 15.5;
+
+      if (_vDur && _aDur && _aDur > _vDur + 0.15 && _vDur <= LOOPABLE_MAX) {
+        // SHORT CLIP, VOICE LONGER — loop it. Looping needs a re-encode;
+        // -c:v copy with -stream_loop produces broken timestamps.
+        cmd.input(vPath).inputOptions(['-stream_loop', '-1']);
+        cmd.input(aPath);
+        outOpts = [
+          '-map', '0:v', '-map', '1:a',
+          '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '20',
           '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
-          '-shortest',          // stop at video end (TTS may be slightly shorter/longer)
+          '-t', String(_aDur.toFixed(3)),   // stop exactly at the end of the voice
           '-movflags', '+faststart'
-        ])
+        ];
+        console.log(`[${job_id}] voice-merge: looping ${_vDur.toFixed(2)}s clip to cover ${_aDur.toFixed(2)}s of speech`);
+      } else if (_vDur && _aDur && _aDur > _vDur + 0.15) {
+        // LONG SEQUENCE, VOICE LONGER — hold the last frame rather than
+        // replaying the opening. The mouth stops moving for the overhang,
+        // which is a smaller price than a visible restart mid-narration.
+        const _pad = (_aDur - _vDur).toFixed(3);
+        cmd.input(vPath);
+        cmd.input(aPath);
+        outOpts = [
+          '-map', '0:v', '-map', '1:a',
+          '-vf', 'tpad=stop_mode=clone:stop_duration=' + _pad,
+          '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '20',
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+          '-t', String(_aDur.toFixed(3)),
+          '-movflags', '+faststart'
+        ];
+        console.log(`[${job_id}] voice-merge: holding final frame ${_pad}s to cover ${_aDur.toFixed(2)}s of speech`);
+      } else if (_vDur && _aDur) {
+        // VOICE SHORTER (or equal) — keep every frame the customer paid for
+        // and pad the audio out with silence.
+        cmd.input(vPath);
+        cmd.input(aPath);
+        outOpts = [
+          '-map', '0:v', '-map', '1:a',
+          '-c:v', 'copy',                  // no re-encode — fast + lossless
+          '-af', 'apad',                   // silence after the voice ends
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+          '-t', String(_vDur.toFixed(3)),  // full video length, never shorter
+          '-movflags', '+faststart'
+        ];
+      } else {
+        // Probe failed — original behaviour, so a merge still happens.
+        cmd.input(vPath);
+        cmd.input(aPath);
+        outOpts = [
+          '-map', '0:v', '-map', '1:a',
+          '-c:v', 'copy',
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+          '-shortest',
+          '-movflags', '+faststart'
+        ];
+        console.warn(`[${job_id}] voice-merge: probe failed, using -shortest fallback`);
+      }
+
+      cmd.outputOptions(outOpts)
         .output(outPath)
         .on('end', resolve)
         .on('error', (err) => reject(new Error('voice-merge ffmpeg error: ' + err.message)))
@@ -519,100 +608,27 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
   }
 });
 
-// ─── LIP-SYNC (Wav2Lip via Replicate) ─────────────────────────
-// Makes the video's mouth movements match the given audio — used for the
-// 11 languages that don't get Native Audio (everything except English and
-// Chinese, which Seedance already handles natively). Wav2Lip works purely
-// off the audio waveform, not language understanding, so it needs zero
-// per-language configuration — one endpoint covers all 11 automatically.
+// ── /lip-sync DELIBERATELY NOT RESTORED (20 Oct 2026) ──────────────────
+// The 24 Sep version of this route called REPLICATE Wav2Lip, which bills
+// per prediction. Elite's instruction, 20 Oct: "we don't use Wav2Lip, make
+// sure of it -- that is just for customers paying by credit, I don't want
+// to pay for it."
 //
-// Body: { video_url, audio_url, job_id }
-// Cost: ~$0.005-0.016 per run on Replicate's GPU — negligible against plan margins.
+// So it is removed on purpose, NOT lost. To bring it back, take it from
+// commit 3e86bfe -- but note it needs REPLICATE_API_TOKEN and
+// REPLICATE_WAV2LIP_MODEL and costs money on every call.
 //
-// REQUIRED env vars:
-//   REPLICATE_API_TOKEN     — from replicate.com/account/api-tokens
-//   REPLICATE_WAV2LIP_MODEL — "owner/name:versionhash", e.g.
-//     "devxpy/cog-wav2lip:3ee...". Copy the current version hash from the
-//     model's page on replicate.com (Docs/API tab) — community models
-//     (not Replicate's own "official" models) require this exact pinned
-//     version, not just the bare owner/name.
-app.post('/lip-sync', requireAuth, async (req, res) => {
-  const { video_url, audio_url, job_id } = req.body || {};
-  if (!video_url || !audio_url) {
-    return res.status(400).json({ error: 'video_url and audio_url required' });
-  }
-  const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
-  const REPLICATE_MODEL = process.env.REPLICATE_WAV2LIP_MODEL; // "owner/name:version"
-  if (!REPLICATE_TOKEN || !REPLICATE_MODEL) {
-    return res.status(500).json({ error: 'Lip-sync not configured — set REPLICATE_API_TOKEN and REPLICATE_WAV2LIP_MODEL' });
-  }
+// The product's two REAL lip-syncs are both on Netlify and unaffected:
+//   /.netlify/functions/sync-lipsync      -> Lip Sync tool  (video + audio)
+//   /.netlify/functions/infinitetalk-proxy -> Talking Avatar (photo + audio)
+// Both are customer-paid via edit credits. Neither touches this service.
+//
+// index.html still references MERGE_SERVICE_URL + '/lip-sync' behind
+// window.TAH_LIPSYNC, which defaults to FALSE. With this route absent that
+// call is never made; if the flag were ever switched on it would 404 and be
+// swallowed by the frontend's own error handling. No charge either way.
+// ───────────────────────────────────────────────────────────────────────
 
-  console.log(`[${job_id}] lip-sync started`);
-  setJob(job_id, { status: 'processing' });
-
-  try {
-    await updateJob(job_id, 'syncing');
-    res.json({ status: 'processing', job_id, message: 'lip-sync started' });
-
-    const version = REPLICATE_MODEL.includes(':') ? REPLICATE_MODEL.split(':')[1] : null;
-    if (!version) throw new Error('REPLICATE_WAV2LIP_MODEL must include a version hash, e.g. "owner/name:abc123..."');
-
-    // Create the prediction — Replicate runs this async, we poll for completion.
-    const createRes = await fetch('https://api.replicate.com/v1/predictions', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + REPLICATE_TOKEN,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        version: version,
-        input: { face: video_url, audio: audio_url }
-      })
-    });
-    if (!createRes.ok) {
-      const t = await createRes.text().catch(() => '');
-      throw new Error('Replicate create failed: ' + createRes.status + ' ' + t.slice(0, 300));
-    }
-    let prediction = await createRes.json();
-
-    // Poll until done. Wav2Lip typically completes in 6-7 seconds on
-    // Replicate's GPU, but allow a generous ceiling in case of queueing.
-    const started = Date.now();
-    const TIMEOUT_MS = 5 * 60 * 1000;
-    while (!['succeeded', 'failed', 'canceled'].includes(prediction.status)) {
-      if (Date.now() - started > TIMEOUT_MS) throw new Error('lip-sync timed out after 5 minutes');
-      await new Promise((r) => setTimeout(r, 2000));
-      const pollRes = await fetch('https://api.replicate.com/v1/predictions/' + prediction.id, {
-        headers: { 'Authorization': 'Bearer ' + REPLICATE_TOKEN }
-      });
-      prediction = await pollRes.json();
-    }
-    if (prediction.status !== 'succeeded') {
-      throw new Error('Replicate lip-sync failed: ' + (prediction.error || 'unknown error'));
-    }
-
-    const resultUrl = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
-    if (!resultUrl) throw new Error('Replicate returned no output URL');
-
-    // Download Replicate's result and re-upload to our own storage, so the
-    // final URL is on our own domain like every other endpoint's output —
-    // Replicate's own hosted URLs are not guaranteed to stay available long-term.
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tahamtan-lip-'));
-    try {
-      const outPath = path.join(tmpDir, 'out.mp4');
-      await downloadFile(resultUrl, outPath);
-      await updateJob(job_id, 'uploading');
-      const publicUrl = await uploadOutput(job_id, outPath);
-      await updateJob(job_id, 'done', publicUrl);
-      console.log(`[${job_id}] lip-sync done — ${publicUrl}`);
-    } finally {
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
-    }
-  } catch (err) {
-    console.error(`[${job_id}] lip-sync error:`, err.message);
-    await updateJob(job_id, 'error', null, err.message);
-  }
-});
 
 // ─── TRIM ────────────────────────────────────────────────────
 app.post('/trim', requireAuth, (req, res) => runVideoJob(req, res, 'trim', async (inPath, outPath, b) => {
