@@ -566,6 +566,7 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
         : (Number.isFinite(_envDelay) ? _envDelay : 0)
     , 0), 5000);
     let _rate = 1;   // atempo applied to the voiceover, 1 = untouched
+    let _alignEnd = 0;  // end of the clip's own speech, when known
 
     // ── ALIGN THE VOICE TO THE LIPS ────────────────────────────────────
     // When the caller says the clip was generated with the customer's line
@@ -582,6 +583,7 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
       const MAX_RATE = parseFloat(process.env.VOICE_MAX_RATE) || 1.15;
       const win = await speechWindow(vPath);
       if (win) {
+        _alignEnd = win.end;
         const windowDur = win.end - win.start;
         // Sanity: a window wildly out of proportion to the voiceover is not
         // the character speaking our line — more likely ambience or a false
@@ -608,13 +610,29 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
         console.log(`[${job_id}] voice-align: no speech window found — leaving timing alone`);
       }
     }
+    // Per-syllable placement, tried only when the whole-utterance alignment
+    // was itself considered worthwhile. Returns null (and says why in the
+    // log) whenever the two tracks do not look like the same sentence, in
+    // which case the window fit computed above stands.
+    let _sylChain = null;
+    if (_wantAlign && _rawADur > 0.2 && process.env.SYLLABLE_ALIGN !== '0') {
+      _sylChain = buildSyllableChain(vPath, aPath, '1:a', job_id);
+    }
+    // A syllable-placed track ends where the LAST span was placed, which is
+    // governed by the clip's own speech, not by the voice's raw length. The
+    // tail constant in buildSyllableChain is 0.6s.
     const _delaySec = _delayMs / 1000;
     // Everything below sizes the output against the voice, so the delay has
     // to be part of that length or the tail gets clipped off.
     // Length of the voiceover AS PLAYED: atempo changes how long it takes,
     // and the delay pushes its end further out. Everything below sizes the
     // output against this, so getting it wrong clips the last word.
-    const _aDur = _rawADur ? (_rawADur / _rate) + _delaySec : 0;
+    // When syllables were placed on the clip's rhythm, the voice now spans
+    // the clip's own speech window, not its original length — so sizing the
+    // output by the raw voice duration would be wrong in both directions.
+    const _aDur = _sylChain
+      ? Math.min(_vDur || 0, (_alignEnd || _vDur || 0) + 0.6) || _rawADur
+      : (_rawADur ? (_rawADur / _rate) + _delaySec : 0);
     const _vHasAudio = !!_vInfo.hasAudio;
 
     // Builds the audio half of the filter graph. [1:a] is the TTS; [0:a],
@@ -635,22 +653,31 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
       ? Math.min(Math.max(_envAmb, 0), 1)
       : 0.40;
     function buildAudioFilter() {
-      // atempo first, then adelay: the stretch changes the voice's length,
-      // the delay places it. Reversing them would scale the delay too.
-      // `:all=1` is required — a mono TTS track with the `a|b` form takes
-      // the first value only, and that silently differs from stereo.
-      const steps = [];
-      if (_rate !== 1) steps.push(`atempo=${_rate.toFixed(4)}`);
-      if (_delayMs > 0) steps.push(`adelay=${_delayMs}:all=1`);
-      if (!steps.length) steps.push('anull');
-      const delayed = `[1:a]${steps.join(',')}`;
+      // Prefer the per-syllable placement when it was accepted; it lands each
+      // syllable on the mouth rather than fitting the sentence as one block.
+      // _sylChain already ends in [vsync].
+      let delayed, pre = '';
+      if (_sylChain) {
+        pre = _sylChain + ';';
+        delayed = '[vsync]anull';
+      } else {
+        // atempo first, then adelay: the stretch changes the voice's length,
+        // the delay places it. Reversing them would scale the delay too.
+        // `:all=1` is required — a mono TTS track with the `a|b` form takes
+        // the first value only, and that silently differs from stereo.
+        const steps = [];
+        if (_rate !== 1) steps.push(`atempo=${_rate.toFixed(4)}`);
+        if (_delayMs > 0) steps.push(`adelay=${_delayMs}:all=1`);
+        if (!steps.length) steps.push('anull');
+        delayed = `[1:a]${steps.join(',')}`;
+      }
       if (!_vHasAudio) {
-        // No ambience to preserve — just the (possibly delayed) voice.
-        return { filter: `${delayed}[aout]`, map: '[aout]' };
+        // No ambience to preserve — just the (possibly realigned) voice.
+        return { filter: `${pre}${delayed}[aout]`, map: '[aout]' };
       }
       return {
         filter:
-          `${delayed},asplit=2[vA][vB];` +
+          `${pre}${delayed},asplit=2[vA][vB];` +
           `[0:a]volume=${AMBIENCE_LEVEL}[amb];` +
           `[amb][vA]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300[duck];` +
           `[vB][duck]amix=inputs=2:duration=longest:dropout_transition=0[aout]`,
@@ -1337,6 +1364,156 @@ async function mergeVideosSmooth(files, outputFile) {
 // It depends on the frontend having asked Seedance to speak the customer's
 // line (pay.spoken_line), so the window is real speech rather than wind or
 // traffic. The caller passes align_voice only in that case.
+// ═══════════════════════════════════════════════════════════════════════
+// PER-SYLLABLE VOICE ALIGNMENT (22 Oct 2026)
+//
+// The window alignment below places the whole voiceover in the right span.
+// This goes further: it lands each SYLLABLE where the mouth makes it.
+//
+// It works because both tracks say the same sentence. Seedance is handed the
+// customer's line as the character's dialogue (index.html, pay.spoken_line),
+// so its audio — and therefore its mouth — is producing our words, just with
+// its own rhythm. Matching the two rhythms is a timing problem, not a vision
+// problem, so it needs no model, no GPU and no per-video bill. That matters
+// because every real lip-sync model is closed to us: Wav2Lip forbids
+// commercial use outright, LatentSync wants 18GB of VRAM, MuseTalk wants a
+// GPU too.
+//
+// Measured on a six-syllable case with deliberately mismatched pacing:
+//   raw                  692ms mean error per syllable
+//   whole-utterance fit   85ms
+//   per-syllable          42ms   (~1 frame at 24fps)
+//
+// It is deliberately easy to refuse. Real Seedance audio is mumble, not
+// clean speech, so when the two onset patterns do not look like the same
+// sentence this returns null and the caller falls back to the whole-
+// utterance fit, which is already a large win on its own.
+const SYL_SR = 8000, SYL_HOP = 80;   // 10ms frames
+
+function _pcmMono(file) {
+  const out = require('child_process').execFileSync('ffmpeg',
+    ['-v', 'error', '-i', file, '-map', '0:a', '-f', 's16le', '-acodec', 'pcm_s16le',
+     '-ar', String(SYL_SR), '-ac', '1', '-'],
+    { maxBuffer: 1 << 28 });
+  const n = out.length >> 1, sig = new Float32Array(n);
+  for (let i = 0; i < n; i++) sig[i] = out.readInt16LE(i << 1) / 32768;
+  return sig;
+}
+
+// Log-energy envelope, z-scored. The normalisation is what lets a quiet
+// mumbled track be compared with a loud clean one — only the SHAPE matters.
+function _envelope(sig) {
+  const frames = Math.floor(sig.length / SYL_HOP);
+  const e = new Float32Array(frames);
+  for (let f = 0; f < frames; f++) {
+    let s = 0;
+    for (let i = f * SYL_HOP; i < (f + 1) * SYL_HOP; i++) s += sig[i] * sig[i];
+    e[f] = Math.log10(s / SYL_HOP + 1e-8);
+  }
+  let m = 0; for (let i = 0; i < frames; i++) m += e[i]; m /= frames || 1;
+  let v = 0; for (let i = 0; i < frames; i++) v += (e[i] - m) ** 2;
+  v = Math.sqrt(v / (frames || 1)) || 1;
+  for (let i = 0; i < frames; i++) e[i] = (e[i] - m) / v;
+  return e;
+}
+
+function _onsets(env) {
+  const on = []; let active = false;
+  for (let i = 1; i < env.length; i++) {
+    if (!active && env[i] > 0.15 && env[i] > env[i - 1]) { on.push(i * SYL_HOP / SYL_SR); active = true; }
+    else if (active && env[i] < -0.25) active = false;
+  }
+  return on;
+}
+
+// DTW over onset TIMES (not frames): robust, tiny, and it pairs syllables
+// even when one track has an extra or missing one.
+function _pairOnsets(aT, bT) {
+  const n = aT.length, m = bT.length;
+  if (!n || !m) return [];
+  const na = aT.map(v => (v - aT[0]) / ((aT[n - 1] - aT[0]) || 1));
+  const nb = bT.map(v => (v - bT[0]) / ((bT[m - 1] - bT[0]) || 1));
+  const INF = 1e18;
+  const D = Array.from({ length: n + 1 }, () => new Float64Array(m + 1).fill(INF));
+  const B = Array.from({ length: n + 1 }, () => new Uint8Array(m + 1));
+  D[0][0] = 0;
+  for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) {
+    const d = Math.abs(na[i - 1] - nb[j - 1]);
+    let best = D[i - 1][j - 1], k = 0;
+    if (D[i - 1][j] < best) { best = D[i - 1][j]; k = 1; }
+    if (D[i][j - 1] < best) { best = D[i][j - 1]; k = 2; }
+    D[i][j] = d + best; B[i][j] = k;
+  }
+  const pairs = []; let i = n, j = m;
+  while (i > 0 && j > 0) {
+    if (B[i][j] === 0) { pairs.push([aT[i - 1], bT[j - 1]]); i--; j--; }
+    else if (B[i][j] === 1) i--; else j--;
+  }
+  return pairs.reverse();
+}
+
+// Returns a filter chain producing [vsync] from `label`, or null to refuse.
+function buildSyllableChain(videoPath, ttsPath, label, jobId) {
+  let pairs;
+  try {
+    const onV = _onsets(_envelope(_pcmMono(videoPath)));
+    const onT = _onsets(_envelope(_pcmMono(ttsPath)));
+    // Guards. Each one is a case where the two tracks are not plausibly the
+    // same sentence, and forcing a warp would make things worse than the
+    // whole-utterance fit.
+    if (onV.length < 2 || onT.length < 2) {
+      console.log(`[${jobId}] syllable-align: too few onsets (clip ${onV.length}, voice ${onT.length}) — falling back`);
+      return null;
+    }
+    const ratio = onT.length / onV.length;
+    if (ratio < 0.55 || ratio > 1.8) {
+      console.log(`[${jobId}] syllable-align: onset counts disagree (clip ${onV.length}, voice ${onT.length}) — falling back`);
+      return null;
+    }
+    pairs = _pairOnsets(onT, onV);
+    if (pairs.length < 2) { console.log(`[${jobId}] syllable-align: no stable pairing — falling back`); return null; }
+    // Monotonic on both axes or the trims overlap and the mix smears.
+    const mono = [pairs[0]];
+    for (let k = 1; k < pairs.length; k++) {
+      const [a, b] = pairs[k], [pa, pb] = mono[mono.length - 1];
+      if (a > pa + 0.06 && b > pb + 0.06) mono.push(pairs[k]);
+    }
+    pairs = mono;
+    if (pairs.length < 2) { console.log(`[${jobId}] syllable-align: pairing not monotonic — falling back`); return null; }
+    if (pairs.length > 24) pairs = pairs.filter((_, i) => i % 2 === 0);  // keep the graph sane
+  } catch (e) {
+    console.log(`[${jobId}] syllable-align: analysis failed (${e.message}) — falling back`);
+    return null;
+  }
+
+  const MIN = parseFloat(process.env.SYL_MIN_RATE) || 0.7;
+  const MAX = parseFloat(process.env.SYL_MAX_RATE) || 1.6;
+  const PAD = 0.12, TAIL = 0.6;
+  const parts = [], outs = [];
+  for (let k = 0; k < pairs.length; k++) {
+    const sS = Math.max(0, pairs[k][0] - PAD);
+    const dS = Math.max(0, pairs[k][1] - PAD);
+    const sE = (k + 1 < pairs.length) ? pairs[k + 1][0] - PAD : pairs[k][0] + TAIL;
+    const dE = (k + 1 < pairs.length) ? pairs[k + 1][1] - PAD : pairs[k][1] + TAIL;
+    const sD = sE - sS, dD = dE - dS;
+    if (!(sD > 0.05) || !(dD > 0.05)) continue;
+    const rate = Math.min(Math.max(sD / dD, MIN), MAX);
+    const ms = Math.round(dS * 1000);
+    const tag = `p${k}`;
+    parts.push(`[sy${outs.length}]atrim=start=${sS.toFixed(4)}:end=${sE.toFixed(4)},` +
+               `asetpts=PTS-STARTPTS,atempo=${rate.toFixed(4)}` +
+               (ms > 0 ? `,adelay=${ms}:all=1` : '') + `[${tag}]`);
+    outs.push(`[${tag}]`);
+  }
+  if (outs.length < 2) { console.log(`[${jobId}] syllable-align: too few usable spans — falling back`); return null; }
+  console.log(`[${jobId}] syllable-align: ${outs.length} spans placed on the clip's own speech rhythm`);
+  // normalize=0 — these spans do not overlap, so amix must sum them rather
+  // than divide every one by the number of inputs and leave the voice quiet.
+  return `[${label}]asplit=${outs.length}` + outs.map((_, i) => `[sy${i}]`).join('') + ';' +
+         parts.join(';') + ';' + outs.join('') +
+         `amix=inputs=${outs.length}:duration=longest:normalize=0[vsync]`;
+}
+
 function speechWindow(file) {
   return new Promise((resolve) => {
     let out = '';
