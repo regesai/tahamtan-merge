@@ -1414,14 +1414,41 @@ function _envelope(sig) {
   let v = 0; for (let i = 0; i < frames; i++) v += (e[i] - m) ** 2;
   v = Math.sqrt(v / (frames || 1)) || 1;
   for (let i = 0; i < frames; i++) e[i] = (e[i] - m) / v;
+  // rawSd is carried out alongside the normalised envelope: once z-scored,
+  // a flat track is indistinguishable from a speaking one.
+  e.rawSd = v;
   return e;
 }
 
-function _onsets(env) {
-  const on = []; let active = false;
+// REFRACTORY + FLATNESS GUARD (22 Oct 2026)
+// Two failure modes found by measurement, both on steady sound:
+//
+//  1. A near-constant track (room tone, wind, a held note) has almost no
+//     envelope variance, so the z-scoring in _envelope() divides by ~0 and
+//     amplifies dither into hundreds of threshold crossings. A 15s steady
+//     tone produced 562 "onsets", a 60s one 2363. The count guard caught it
+//     and fell back, but on a real clip that has speech AND a steady
+//     background the same inflation would push the ratio out of range and
+//     refuse a clip that should have aligned.
+//
+//  2. No language articulates faster than roughly 8 syllables a second, so
+//     anything closer together than MIN_GAP is not a new syllable.
+//
+// rawSd is the spread of the log-energy BEFORE normalisation, which is what
+// tells a flat track from a speaking one — after z-scoring every track looks
+// equally varied, which is precisely how the bug hid.
+const SYL_MIN_GAP = 0.12;    // seconds; ~8 syllables/sec ceiling
+const SYL_MIN_SD  = 0.25;    // log10 energy spread below which it is not speech
+
+function _onsets(env, rawSd) {
+  if (typeof rawSd === 'number' && rawSd < SYL_MIN_SD) return [];
+  const on = []; let active = false; let lastT = -1e9;
   for (let i = 1; i < env.length; i++) {
-    if (!active && env[i] > 0.15 && env[i] > env[i - 1]) { on.push(i * SYL_HOP / SYL_SR); active = true; }
-    else if (active && env[i] < -0.25) active = false;
+    const t = i * SYL_HOP / SYL_SR;
+    if (!active && env[i] > 0.15 && env[i] > env[i - 1]) {
+      if (t - lastT >= SYL_MIN_GAP) { on.push(t); lastT = t; }
+      active = true;
+    } else if (active && env[i] < -0.25) active = false;
   }
   return on;
 }
@@ -1456,8 +1483,10 @@ function _pairOnsets(aT, bT) {
 function buildSyllableChain(videoPath, ttsPath, label, jobId) {
   let pairs;
   try {
-    const onV = _onsets(_envelope(_pcmMono(videoPath)));
-    const onT = _onsets(_envelope(_pcmMono(ttsPath)));
+    const envV = _envelope(_pcmMono(videoPath));
+    const envT = _envelope(_pcmMono(ttsPath));
+    const onV = _onsets(envV, envV.rawSd);
+    const onT = _onsets(envT, envT.rawSd);
     // Guards. Each one is a case where the two tracks are not plausibly the
     // same sentence, and forcing a warp would make things worse than the
     // whole-utterance fit.
@@ -1492,12 +1521,24 @@ function buildSyllableChain(videoPath, ttsPath, label, jobId) {
   const parts = [], outs = [];
   for (let k = 0; k < pairs.length; k++) {
     const sS = Math.max(0, pairs[k][0] - PAD);
-    const dS = Math.max(0, pairs[k][1] - PAD);
+    // The lead-in actually available can be SHORTER than PAD when the
+    // syllable sits near the start of the voice track — sS clamps at 0. The
+    // target delay has to subtract what was really taken, not the nominal
+    // PAD, or that span lands early by the difference. Only the first
+    // syllable is normally affected, and it was the worst in the test
+    // (-70ms against ~-30ms for the rest).
+    const leadIn = pairs[k][0] - sS;
+    const dS = Math.max(0, pairs[k][1] - leadIn);
     const sE = (k + 1 < pairs.length) ? pairs[k + 1][0] - PAD : pairs[k][0] + TAIL;
     const dE = (k + 1 < pairs.length) ? pairs[k + 1][1] - PAD : pairs[k][1] + TAIL;
     const sD = sE - sS, dD = dE - dS;
     if (!(sD > 0.05) || !(dD > 0.05)) continue;
     const rate = Math.min(Math.max(sD / dD, MIN), MAX);
+    // A PAD/rate "correction" was tried here and MEASURED WORSE (29ms mean
+    // error -> 43ms), so it is deliberately absent. The reasoning behind it
+    // — that atempo rescales the lead-in pad, so the delay should subtract
+    // PAD/rate rather than PAD — is sound on paper and wrong in practice.
+    // Do not re-derive it without re-measuring.
     const ms = Math.round(dS * 1000);
     const tag = `p${k}`;
     parts.push(`[sy${outs.length}]atrim=start=${sS.toFixed(4)}:end=${sE.toFixed(4)},` +
