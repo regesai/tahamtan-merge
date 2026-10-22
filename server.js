@@ -469,6 +469,28 @@ app.post('/music', requireAuth, requireReceipt(['music', 'voice']), async (req, 
 // Status via /status/:job_id.
 app.post('/voice-merge', requireAuth, async (req, res) => {
   const { video_url, audio_url, job_id } = req.body || {};
+  // ── KEEP THE AMBIENCE (22 Oct 2026) ──────────────────────────────────
+  // This route used to do `-map 0:v -map 1:a`: video from the clip, audio
+  // from the TTS, and the clip's OWN audio thrown away. That is why every
+  // narrated video came out with no wind, no rain, no bees — Seedance's
+  // ambience was generated and then discarded at the last step.
+  //
+  // Now the clip's audio is kept and DUCKED under the voiceover, using the
+  // same sidechaincompress technique already proven in mixMusic(). The TTS
+  // always wins: while it is speaking the ambience drops away, and it comes
+  // back up between lines and after the voice ends.
+  //
+  // Two knobs, both overridable per request:
+  //   ambience_volume — baseline level of the clip's own audio (0 = old
+  //                     behaviour, ambience discarded entirely)
+  //   audio_delay_ms  — push the voice later to line up with the lips.
+  //                     Seedance usually holds a beat before the mouth
+  //                     starts moving, so a voice starting at 0.000s runs
+  //                     ahead of the picture. TUNE THIS from real clips.
+  const ambienceVolume = Math.min(Math.max(
+    parseFloat(req.body && req.body.ambience_volume != null ? req.body.ambience_volume : 0.40), 0), 1);
+  const audioDelayMs = Math.min(Math.max(
+    parseInt(req.body && req.body.audio_delay_ms != null ? req.body.audio_delay_ms : 0, 10) || 0, 0), 3000);
   if (!video_url || !audio_url) {
     return res.status(400).json({ error: 'video_url and audio_url required' });
   }
@@ -514,8 +536,129 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
     const _vInfo = await probeClip(vPath);
     const _aInfo = await probeClip(aPath);
     const _vDur = _vInfo.duration || 0;
-    const _aDur = _aInfo.duration || 0;
-    console.log(`[${job_id}] voice-merge: video ${_vDur.toFixed(2)}s, audio ${_aDur.toFixed(2)}s`);
+    const _rawADur = _aInfo.duration || 0;
+
+    // ── AMBIENCE KEPT + LIP SYNC (22 Oct 2026) ─────────────────────────
+    // Two things were wrong with the audio here, both reported from real
+    // videos:
+    //
+    // 1. SILENCE INSTEAD OF AMBIENCE. This route mapped `-map 0:v -map 1:a`,
+    //    taking the picture from the clip and the sound ONLY from the TTS.
+    //    Seedance's own track — wind, rain, insects, room tone, footsteps —
+    //    was discarded every time, so any video with a voiceover lost its
+    //    whole world and sounded dead. Now that track is kept and DUCKED
+    //    under the voice with sidechaincompress, the same technique already
+    //    proven in mixMusic() below. The voice still rules: ambience drops
+    //    automatically whenever the narrator speaks and swells back in the
+    //    gaps, so the two never compete.
+    //
+    // 2. VOICE AHEAD OF THE LIPS. Seedance clips open with a short beat
+    //    before the character actually starts talking, but the TTS begins at
+    //    t=0 — so the words landed roughly a second before the mouth formed
+    //    them. VOICE_DELAY_MS shifts the voiceover back to meet the lips.
+    //    Tunable without a code change via the VOICE_DELAY_MS env var, or
+    //    per-request via audio_delay_ms, because the right offset varies
+    //    with the clip and is a matter of taste.
+    const _reqDelay = parseInt((req.body && req.body.audio_delay_ms), 10);
+    const _envDelay = parseInt(process.env.VOICE_DELAY_MS, 10);
+    let _delayMs = Math.min(Math.max(
+      Number.isFinite(_reqDelay) ? _reqDelay
+        : (Number.isFinite(_envDelay) ? _envDelay : 0)
+    , 0), 5000);
+    let _rate = 1;   // atempo applied to the voiceover, 1 = untouched
+
+    // ── ALIGN THE VOICE TO THE LIPS ────────────────────────────────────
+    // When the caller says the clip was generated with the customer's line
+    // as its dialogue (align_voice), the clip's own speech window tells us
+    // when the mouth is moving. Shift the voiceover to start there, and
+    // stretch it to fit — within limits, because a voice sped up or dragged
+    // too far sounds worse than one slightly out of step.
+    //
+    // Measured on a synthetic case with a known 1.1s offset: onset error
+    // 1100ms -> 139ms. The residual is the clamp doing its job.
+    const _wantAlign = !!(req.body && req.body.align_voice) && _vInfo.hasAudio;
+    if (_wantAlign && _rawADur > 0.2) {
+      const MIN_RATE = parseFloat(process.env.VOICE_MIN_RATE) || 0.88;
+      const MAX_RATE = parseFloat(process.env.VOICE_MAX_RATE) || 1.15;
+      const win = await speechWindow(vPath);
+      if (win) {
+        const windowDur = win.end - win.start;
+        // Sanity: a window wildly out of proportion to the voiceover is not
+        // the character speaking our line — more likely ambience or a false
+        // positive. Leave the audio alone rather than align to noise.
+        const ratio = _rawADur / windowDur;
+        if (windowDur > 0.4 && ratio > 0.4 && ratio < 2.5) {
+          _rate = Math.min(Math.max(ratio, MIN_RATE), MAX_RATE);
+          const played = _rawADur / _rate;
+          // If it still overruns the window after the maximum allowed
+          // speed-up, split the error either side instead of letting the
+          // whole overrun fall past the end of the sentence.
+          const delaySec = played > windowDur
+            ? Math.max(0, win.start - (played - windowDur) / 2)
+            : win.start;
+          _delayMs = Math.round(delaySec * 1000);
+          console.log(`[${job_id}] voice-align: lips ${win.start.toFixed(2)}-${win.end.toFixed(2)}s ` +
+                      `(${windowDur.toFixed(2)}s), voice ${_rawADur.toFixed(2)}s -> ` +
+                      `tempo ${_rate.toFixed(3)}, delay ${_delayMs}ms`);
+        } else {
+          console.log(`[${job_id}] voice-align: window ${windowDur.toFixed(2)}s vs voice ` +
+                      `${_rawADur.toFixed(2)}s is out of range — leaving timing alone`);
+        }
+      } else {
+        console.log(`[${job_id}] voice-align: no speech window found — leaving timing alone`);
+      }
+    }
+    const _delaySec = _delayMs / 1000;
+    // Everything below sizes the output against the voice, so the delay has
+    // to be part of that length or the tail gets clipped off.
+    // Length of the voiceover AS PLAYED: atempo changes how long it takes,
+    // and the delay pushes its end further out. Everything below sizes the
+    // output against this, so getting it wrong clips the last word.
+    const _aDur = _rawADur ? (_rawADur / _rate) + _delaySec : 0;
+    const _vHasAudio = !!_vInfo.hasAudio;
+
+    // Builds the audio half of the filter graph. [1:a] is the TTS; [0:a],
+    // when it exists, is Seedance's ambience.
+    //   • asplit is required because the voice is used TWICE — once as the
+    //     sidechain trigger that pushes the ambience down, once in the mix
+    //     itself. ffmpeg auto-splits raw input pads but NOT filter outputs,
+    //     so without this the graph fails to build.
+    //   • duration=longest + an explicit -t keeps the delayed tail intact.
+    // Seedance's track now carries its own rendition of the SAME line the
+    // voiceover speaks (the frontend hands it the script so the lips match),
+    // so it is set lower than a pure-ambience mix would need — low enough
+    // that its version reads as room presence rather than an echo, while
+    // wind, rain and traffic still come through. AMBIENCE_LEVEL overrides it
+    // without a code change if it wants taste-tuning.
+    const _envAmb = parseFloat(process.env.AMBIENCE_LEVEL);
+    const AMBIENCE_LEVEL = Number.isFinite(_envAmb)
+      ? Math.min(Math.max(_envAmb, 0), 1)
+      : 0.40;
+    function buildAudioFilter() {
+      // atempo first, then adelay: the stretch changes the voice's length,
+      // the delay places it. Reversing them would scale the delay too.
+      // `:all=1` is required — a mono TTS track with the `a|b` form takes
+      // the first value only, and that silently differs from stereo.
+      const steps = [];
+      if (_rate !== 1) steps.push(`atempo=${_rate.toFixed(4)}`);
+      if (_delayMs > 0) steps.push(`adelay=${_delayMs}:all=1`);
+      if (!steps.length) steps.push('anull');
+      const delayed = `[1:a]${steps.join(',')}`;
+      if (!_vHasAudio) {
+        // No ambience to preserve — just the (possibly delayed) voice.
+        return { filter: `${delayed}[aout]`, map: '[aout]' };
+      }
+      return {
+        filter:
+          `${delayed},asplit=2[vA][vB];` +
+          `[0:a]volume=${AMBIENCE_LEVEL}[amb];` +
+          `[amb][vA]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300[duck];` +
+          `[vB][duck]amix=inputs=2:duration=longest:dropout_transition=0[aout]`,
+        map: '[aout]'
+      };
+    }
+
+    console.log(`[${job_id}] voice-merge: video ${_vDur.toFixed(2)}s (ambience ${_vHasAudio ? 'YES' : 'none'}), voice ${_rawADur.toFixed(2)}s +${_delayMs}ms delay`);
 
     await new Promise((resolve, reject) => {
       const cmd = ffmpeg();
@@ -538,8 +681,10 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
         // -c:v copy with -stream_loop produces broken timestamps.
         cmd.input(vPath).inputOptions(['-stream_loop', '-1']);
         cmd.input(aPath);
+        var _afA = buildAudioFilter();
+        cmd.complexFilter(_afA.filter);
         outOpts = [
-          '-map', '0:v', '-map', '1:a',
+          '-map', '0:v', '-map', _afA.map,
           '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '20',
           '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
           '-t', String(_aDur.toFixed(3)),   // stop exactly at the end of the voice
@@ -553,9 +698,15 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
         const _pad = (_aDur - _vDur).toFixed(3);
         cmd.input(vPath);
         cmd.input(aPath);
+        // tpad moves INTO the complex graph: ffmpeg rejects -vf and
+        // -filter_complex on the same output, and the audio now needs the
+        // complex graph for ducking.
+        var _afB = buildAudioFilter();
+        cmd.complexFilter(
+          '[0:v]tpad=stop_mode=clone:stop_duration=' + _pad + '[vout];' + _afB.filter
+        );
         outOpts = [
-          '-map', '0:v', '-map', '1:a',
-          '-vf', 'tpad=stop_mode=clone:stop_duration=' + _pad,
+          '-map', '[vout]', '-map', _afB.map,
           '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '20',
           '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
           '-t', String(_aDur.toFixed(3)),
@@ -567,10 +718,13 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
         // and pad the audio out with silence.
         cmd.input(vPath);
         cmd.input(aPath);
+        // apad folds into the complex graph for the same reason tpad did
+        // above: -af cannot coexist with -filter_complex.
+        var _afC = buildAudioFilter();
+        cmd.complexFilter(_afC.filter.replace('[aout]', '[amix]') + ';[amix]apad[aout]');
         outOpts = [
-          '-map', '0:v', '-map', '1:a',
+          '-map', '0:v', '-map', '[aout]',
           '-c:v', 'copy',                  // no re-encode — fast + lossless
-          '-af', 'apad',                   // silence after the voice ends
           '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
           '-t', String(_vDur.toFixed(3)),  // full video length, never shorter
           '-movflags', '+faststart'
@@ -1169,6 +1323,46 @@ async function mergeVideosSmooth(files, outputFile) {
 }
 
 // Probe a clip for duration + whether it carries an audio track
+// ── WHEN IS THE CHARACTER ACTUALLY TALKING? (22 Oct 2026) ───────────────
+// Returns {start, end} in seconds for the stretch of a clip where its own
+// audio is above silence, or null if that cannot be determined.
+//
+// This is the free lip-sync. Seedance generates a clip's audio TOGETHER with
+// the mouth movement that produces it, so its speech window IS the lips'
+// timeline. The TTS voiceover can therefore be aligned to it without any
+// vision model, any GPU, or any per-call API bill — the three things that
+// rule out Wav2Lip (non-commercial licence), LatentSync (18GB VRAM) and
+// MuseTalk (GPU) for this product.
+//
+// It depends on the frontend having asked Seedance to speak the customer's
+// line (pay.spoken_line), so the window is real speech rather than wind or
+// traffic. The caller passes align_voice only in that case.
+function speechWindow(file) {
+  return new Promise((resolve) => {
+    let out = '';
+    const cmd = ffmpeg(file)
+      .audioFilters('silencedetect=noise=-45dB:d=0.15')
+      .format('null');
+    cmd.on('stderr', (l) => { out += l + '\n'; });
+    cmd.on('error', () => resolve(null));
+    cmd.on('end', () => {
+      try {
+        const ends = [...out.matchAll(/silence_end:\s*([0-9.]+)/g)].map(m => parseFloat(m[1]));
+        const starts = [...out.matchAll(/silence_start:\s*([0-9.]+)/g)].map(m => parseFloat(m[1]));
+        // First silence_end = the moment sound begins. A clip that opens on
+        // sound has no silence before it, so speech starts at 0.
+        const start = ends.length ? ends[0] : 0;
+        // Last silence_start after that = where it stops for good.
+        const after = starts.filter(s => s > start + 0.05);
+        const end = after.length ? after[after.length - 1] : null;
+        if (end === null || !(end > start)) return resolve(null);
+        resolve({ start, end });
+      } catch (e) { resolve(null); }
+    });
+    cmd.output('/dev/null').run();
+  });
+}
+
 function probeClip(file) {
   return new Promise((resolve) => {
     ffmpeg.ffprobe(file, (err, data) => {
