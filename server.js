@@ -577,7 +577,30 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
     //
     // Measured on a synthetic case with a known 1.1s offset: onset error
     // 1100ms -> 139ms. The residual is the clamp doing its job.
-    const _wantAlign = !!(req.body && req.body.align_voice) && _vInfo.hasAudio;
+    // ── ALIGNMENT PARKED (23 Oct 2026) ─────────────────────────────────
+    // Elite's call: this model of lip-sync/timing is wrong and comes back in
+    // a different form next week. Both layers below — the whole-window fit
+    // and the per-syllable chain — key off the clip's OWN speech, and from
+    // today the clip has none. The generate prompt now tells Seedance
+    // explicitly not to speak, because its rendition of the customer's line
+    // was audible underneath the customer's TTS (two voices, same sentence,
+    // different pace). With no speech in the clip there is nothing to align
+    // to: at best this does nothing, at worst it anchors the voice to a
+    // sound effect, which is the 295-350ms failure the detector was rebuilt
+    // to avoid in the first place.
+    //
+    // Off here as well as in the frontend (window.TAH_VOICE_ALIGN) on
+    // purpose: a cached index.html keeps sending align_voice:true for days
+    // after a deploy, and this is the side that decides. VOICE_ALIGN=1 in
+    // the environment brings it back for testing without a code change.
+    // Everything below is left intact and working — parked, not deleted.
+    const _alignEnabled = process.env.VOICE_ALIGN === '1';
+    const _wantAlign = _alignEnabled
+      && !!(req.body && req.body.align_voice)
+      && _vInfo.hasAudio;
+    if (!_alignEnabled && req.body && req.body.align_voice) {
+      console.log(`[${job_id}] voice-align: parked (VOICE_ALIGN!=1) — voice plays from the start, unstretched`);
+    }
     if (_wantAlign && _rawADur > 0.2) {
       const MIN_RATE = parseFloat(process.env.VOICE_MIN_RATE) || 0.88;
       const MAX_RATE = parseFloat(process.env.VOICE_MAX_RATE) || 1.15;
@@ -690,16 +713,57 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
         if (!steps.length) steps.push('anull');
         delayed = `[1:a]${steps.join(',')}`;
       }
+      // ── asetpts IS LOAD-BEARING (23 Oct 2026) ────────────────────────
+      // amix hands the muxer a garbage first timestamp (AV_NOPTS, which
+      // surfaces as dts 922337203685 or a stream start_time of
+      // 1152921504606846). On its own that is survivable — but EVERY output
+      // branch below passes `-t`, and -t truncates against that broken
+      // timeline, so the finished mp4 came out 0.43s long and silent while
+      // ffmpeg exited 0. asetpts=N/SR/TB regenerates the timestamps from
+      // the sample count and the audio returns in full.
+      //
+      // Measured, mp4 decoded back (not WAV — see below): without it 0.43s
+      // peak 0.005; with it 5.01s peak 0.417.
+      //
+      // This hid for a reason worth recording: every alignment test until
+      // now wrote WAV, and WAV has no timestamps, so a chain with perfect
+      // samples and broken PTS measured flawless. It only became reachable
+      // on most videos today, when native audio was switched on for every
+      // language — before that a clip with no audio took the branch just
+      // below, which has no amix in it. Test the container you ship.
+      const FIXPTS = ',asetpts=N/SR/TB';
       if (!_vHasAudio) {
         // No ambience to preserve — just the (possibly realigned) voice.
-        return { filter: `${pre}${delayed}[aout]`, map: '[aout]' };
+        return { filter: `${pre}${delayed}${FIXPTS}[aout]`, map: '[aout]' };
       }
+      // ── apad ON THE KEY IS LOAD-BEARING (23 Oct 2026) ────────────────
+      // sidechaincompress ends when its SHORTEST input ends, and one of its
+      // inputs is the voiceover used as the trigger. The voiceover is almost
+      // always shorter than the clip, so the ducked ambience was being cut
+      // off at the moment the voice stopped — every scene sound after that
+      // point silently discarded.
+      //
+      // It hid behind the apad in the voice-shorter output branch, which
+      // pads the finished mix out to the video's length with SILENCE. So the
+      // video ran full length and simply went quiet partway through, which
+      // reads as "the engine stopped making noise", not as a bug here.
+      //
+      // Padding the KEY instead means the compressor sees a trigger for the
+      // whole clip — silent once the voice ends, so the ambience rises back
+      // to full — and the ambience survives to its own end.
+      //
+      // Measured on a 6s clip with a 2.4s voiceover and a transient at 3.0s:
+      //   before  ducked track 2.41s; transient and everything after it gone
+      //   after   ducked track 6.02s; transient -29.5 dB and tail -47.9 dB,
+      //           both identical to the same ambience with no ducking at all,
+      //           while the voice still gets 8.6 dB of ducking under it.
       return {
         filter:
           `${pre}${delayed},asplit=2[vA][vB];` +
           `[0:a]volume=${AMBIENCE_LEVEL}[amb];` +
-          `[amb][vA]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300[duck];` +
-          `[vB][duck]amix=inputs=2:duration=longest:dropout_transition=0[aout]`,
+          `[vA]apad[vkey];` +
+          `[amb][vkey]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300[duck];` +
+          `[vB][duck]amix=inputs=2:duration=longest:dropout_transition=0${FIXPTS}[aout]`,
         map: '[aout]'
       };
     }
