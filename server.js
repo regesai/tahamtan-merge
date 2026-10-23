@@ -581,7 +581,26 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
     if (_wantAlign && _rawADur > 0.2) {
       const MIN_RATE = parseFloat(process.env.VOICE_MIN_RATE) || 0.88;
       const MAX_RATE = parseFloat(process.env.VOICE_MAX_RATE) || 1.15;
-      const win = await speechWindow(vPath);
+      // ── WHERE THE MOUTH MOVES (23 Oct 2026) ──────────────────────────
+      // speechWindow() finds the window by looking for SILENCE either side
+      // of it (-45dB). Native audio is now generated for every language, so
+      // a clip arrives with a rain bed or a room tone and is never that
+      // quiet anywhere: silencedetect reports no silence, speechWindow
+      // returns null, and this entire fallback went dead the day ambience
+      // was switched on. The voiced span answers the same question by
+      // looking for the speech instead of for the gaps around it, so a bed
+      // of sound does not hide the sentence inside it.
+      //
+      // speechWindow stays as the second choice: on a clip with no scene
+      // audio at all it is equivalent, and it is the one that has run in
+      // production.
+      const _an = speechAnalysis(vPath);
+      const win = _an.span || await speechWindow(vPath);
+      if (_an.span) {
+        console.log(`[${job_id}] voice-align: voiced span ${_an.span.start.toFixed(2)}-${_an.span.end.toFixed(2)}s`);
+      } else if (_an.reason) {
+        console.log(`[${job_id}] voice-align: ${_an.reason}; trying silence detection`);
+      }
       if (win) {
         _alignEnd = win.end;
         const windowDur = win.end - win.start;
@@ -1400,6 +1419,16 @@ function _pcmMono(file) {
   return sig;
 }
 
+// ⚠ NO LONGER IN THE ALIGNMENT PATH (23 Oct 2026). _envelope + _onsets were
+// the original energy-based detector. They are superseded by _analyseSpeech
+// below, which every caller now uses; these two are called by nothing.
+//
+// Kept, not deleted, because the comment block under _onsets records two
+// measured failures (the flatness/z-score blow-up and the refractory gap)
+// that the replacement still has to respect, and because the honest history
+// of what was tried is worth more here than six fewer lines. If you are
+// fixing an alignment bug, the code you want is _analyseSpeech.
+//
 // Log-energy envelope, z-scored. The normalisation is what lets a quiet
 // mumbled track be compared with a loud clean one — only the SHAPE matters.
 function _envelope(sig) {
@@ -1453,6 +1482,214 @@ function _onsets(env, rawSd) {
   return on;
 }
 
+// ═══ SPEECH-SELECTIVE ONSETS (23 Oct 2026) ═══════════════════════════════
+// _onsets() above finds where the energy rises. That was right while the clip
+// either held speech or held nothing. It no longer is: Seedance's own audio is
+// now generated for EVERY language, so every clip arrives with the sound of a
+// scene — footsteps, traffic, rain, a glass hitting the floor.
+//
+// A glass smashing is a larger energy rise than any syllable. Measured on
+// clips carrying both speech and events, with the mouth times known:
+//
+//   clean room, no events ......... 15ms mean error   (what we shipped for)
+//   one smash after the speech .... 295ms,  worst 590ms
+//   smash between syllables ....... 350ms,  worst 590ms
+//   busy scene, five events ....... 257ms,  worst 590ms
+//
+// Worse than the whole-window fallback (~139ms) — the aligner was anchoring
+// the voice to the smash. And a second failure hid inside the first: the
+// level-crossing design arms only after the envelope drops below a floor, so
+// a smash's decay holds it up and the NEXT real syllable is never seen. A
+// mid-speech smash took six detected onsets down to four.
+//
+// Two properties separate a syllable from a scene event, and neither is
+// energy:
+//   • A syllable nucleus is VOICED — vocal folds, 70-350Hz, periodic. A
+//     smash, a door, a footstep is noise. Normalised autocorrelation over
+//     the pitch lags tells them apart outright.
+//   • Speech makes the speech band loud, then quiet, then loud. A hum, a rain
+//     bed, a room tone sits still.
+//
+// Both are needed. Periodicity alone calls a 90Hz engine hum speech — and
+// because normalised autocorrelation is amplitude-invariant, filtering the
+// hum quiet does not change that verdict. Dynamics alone cannot tell a
+// footstep from a syllable. Together: 1.00 precision and 1.00 recall on all
+// seven speech scenes tested, and nothing found in all three no-mouth ones,
+// against 0.63-1.00 precision and two lost-recall failures for _onsets().
+const SYL_WIN     = 256;                          // 32ms — two periods at the lowest pitch
+const SYL_LAG_MIN = Math.floor(SYL_SR / 350);     // 22
+const SYL_LAG_MAX = Math.floor(SYL_SR / 70);      // 114
+const SYL_VOICE_MIN = 0.42;   // normalised autocorrelation: voiced above this
+const SYL_MIN_RANGE = 0.45;   // log10 energy spread (~4.5dB) below which the band is static
+const SYL_ENERGY_FRAC = 0.3;  // an onset must be this far up the band's own range
+
+function _biquad(sig, type, f0, Q) {
+  const w0 = 2 * Math.PI * f0 / SYL_SR, c = Math.cos(w0), al = Math.sin(w0) / (2 * Q);
+  let b0, b1, b2;
+  if (type === 'hp') { b0 = (1 + c) / 2; b1 = -(1 + c); b2 = (1 + c) / 2; }
+  else { b0 = (1 - c) / 2; b1 = 1 - c; b2 = (1 - c) / 2; }
+  const a0 = 1 + al, a1 = -2 * c, a2 = 1 - al;
+  const out = new Float32Array(sig.length);
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  for (let i = 0; i < sig.length; i++) {
+    const x0 = sig[i];
+    const y0 = (b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2) / a0;
+    out[i] = y0; x2 = x1; x1 = x0; y2 = y1; y1 = y0;
+  }
+  return out;
+}
+
+// The high-pass is CASCADED, 24dB/octave. One stage left enough of a 90Hz hum
+// to be called speech. High-passing at 200Hz costs nothing for a deep voice:
+// autocorrelation reads the pitch period from the spacing of the HARMONICS,
+// which are spread across the band, so the fundamental need not survive. What
+// it does cost is the hum, which has nothing above its fundamental at all.
+const _speechBand = (sig) =>
+  _biquad(_biquad(_biquad(sig, 'hp', 200, 0.707), 'hp', 200, 0.707), 'lp', 3400, 0.707);
+
+function _frameEnergy(sig) {
+  const n = Math.floor(sig.length / SYL_HOP), e = new Float32Array(n);
+  for (let f = 0; f < n; f++) {
+    let s = 0;
+    for (let i = f * SYL_HOP; i < (f + 1) * SYL_HOP; i++) s += sig[i] * sig[i];
+    e[f] = Math.log10(s / SYL_HOP + 1e-10);
+  }
+  return e;
+}
+
+// Half-wave rectified first difference: a RISE, which survives an elevated
+// floor. This is what fixes the syllable-lost-behind-a-smash case.
+function _flux(e) {
+  const n = e.length, f = new Float32Array(n);
+  for (let i = 1; i < n; i++) f[i] = Math.max(0, e[i] - e[i - 1]);
+  const s = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let a = 0, c = 0;
+    for (let j = Math.max(0, i - 1); j <= Math.min(n - 1, i + 1); j++) { a += f[j]; c++; }
+    s[i] = a / c;
+  }
+  return s;
+}
+
+// Per-frame periodicity: best normalised autocorrelation at any pitch lag.
+// ~1 for a held vowel, ~0 for noise. Amplitude-invariant by construction.
+//
+// `e`/`eMin` are an optimisation that is also a tightening: every place that
+// reads this result already requires the frame to be loud in the speech band,
+// so computing periodicity for a quiet frame is wasted work — and skipping it
+// means a quiet-but-periodic frame (the tail of a hum, a distant engine)
+// cannot contribute to a syllable's voicing score. Costs about half the
+// analysis time on a clip with pauses in it, which is every real one.
+function _voicing(sig, e, eMin) {
+  const n = Math.floor(sig.length / SYL_HOP), v = new Float32Array(n);
+  for (let f = 0; f < n; f++) {
+    const a = f * SYL_HOP;
+    if (a + SYL_WIN + SYL_LAG_MAX >= sig.length) break;
+    if (e && f < e.length && e[f] < eMin) continue;
+    let e0 = 0;
+    for (let i = 0; i < SYL_WIN; i++) e0 += sig[a + i] * sig[a + i];
+    if (e0 < 1e-7) continue;
+    let best = 0;
+    for (let lag = SYL_LAG_MIN; lag <= SYL_LAG_MAX; lag++) {
+      let num = 0, e1 = 0;
+      for (let i = 0; i < SYL_WIN; i++) {
+        const x = sig[a + i], y = sig[a + i + lag];
+        num += x * y; e1 += y * y;
+      }
+      if (e1 < 1e-9) continue;
+      const r = num / Math.sqrt(e0 * e1);
+      if (r > best) best = r;
+    }
+    v[f] = best;
+  }
+  return v;
+}
+
+function _median(a) {
+  const s = Array.from(a).sort((x, y) => x - y);
+  return s.length ? s[s.length >> 1] : 0;
+}
+
+// Voiced syllable onsets, plus the span the speech occupies. `span` is what
+// the whole-utterance fallback needs and silencedetect can no longer give:
+// an ambient clip is never below -45dB, so silencedetect finds no silence,
+// returns no window, and that fallback went dead the moment native audio was
+// switched on for every language. This span is derived from where the clip is
+// VOICED, so a rain bed does not hide the sentence inside it.
+function _analyseSpeech(sig) {
+  const b = _speechBand(sig);
+  const e = _frameEnergy(b);
+  const fx = _flux(e);
+  const n = fx.length;
+  if (n < 5) return { onsets: [], span: null, reason: 'track too short' };
+
+  const srt = Array.from(e).sort((x, y) => x - y);
+  const floor = srt[Math.floor(n * 0.2)], ceil = srt[Math.floor(n * 0.9)];
+  const range = ceil - floor;
+  if (range < SYL_MIN_RANGE) {
+    return { onsets: [], span: null, reason: `speech band is static (${(range * 10).toFixed(1)}dB range)` };
+  }
+  const eMin = floor + SYL_ENERGY_FRAC * range;
+  const vo = _voicing(b, e, eMin);
+
+  // Where is this clip voiced AND loud in the speech band? That is the mouth.
+  let first = -1, last = -1, voiced = 0;
+  for (let i = 0; i < n; i++) {
+    if (vo[i] > SYL_VOICE_MIN && e[i] > eMin) {
+      voiced++;
+      if (first < 0) first = i;
+      last = i;
+    }
+  }
+  if (voiced / n < 0.04) {
+    return { onsets: [], span: null, reason: `no speech in the track (${(voiced / n * 100).toFixed(1)}% voiced)` };
+  }
+
+  const LOOK = Math.round(0.07 * SYL_SR / SYL_HOP);   // the nucleus follows the attack
+  const WINF = Math.round(0.75 * SYL_SR / SYL_HOP);   // local window for the threshold
+  const K = 1.3;
+  const on = [];
+  let lastT = -1e9;
+  for (let i = 1; i < n - 1; i++) {
+    const a = Math.max(0, i - WINF), z = Math.min(n, i + WINF);
+    const med = _median(fx.subarray(a, z));
+    let mad = 0, c = 0;
+    for (let j = a; j < z; j++) { mad += Math.abs(fx[j] - med); c++; }
+    mad /= (c || 1);
+    if (!(fx[i] > med + K * (mad || 1e-6))) continue;
+    if (!(fx[i] >= fx[i - 1] && fx[i] >= fx[i + 1])) continue;
+    let vmax = 0, emax = -1e9;
+    for (let j = i; j < Math.min(n, i + LOOK); j++) {
+      if (vo[j] > vmax) vmax = vo[j];
+      if (e[j] > emax) emax = e[j];
+    }
+    if (vmax < SYL_VOICE_MIN || emax < eMin) continue;   // a thud, not a syllable
+    const t = i * SYL_HOP / SYL_SR;
+    if (t - lastT >= SYL_MIN_GAP) { on.push(t); lastT = t; }
+  }
+  return {
+    onsets: on,
+    span: first >= 0 && last > first
+      ? { start: first * SYL_HOP / SYL_SR, end: (last + 1) * SYL_HOP / SYL_SR }
+      : null,
+    reason: null
+  };
+}
+
+// Decoding a clip costs 175-324ms of blocked event loop, and the window fit
+// and the syllable placement both want the same analysis of the same file.
+// One slot is all that is needed: within a job they ask about the same path
+// back to back.
+let _speechCache = { file: null, result: null };
+function speechAnalysis(file) {
+  if (_speechCache.file === file) return _speechCache.result;
+  let result;
+  try { result = _analyseSpeech(_pcmMono(file)); }
+  catch (e) { result = { onsets: [], span: null, reason: `analysis failed (${e.message})` }; }
+  _speechCache = { file, result };
+  return result;
+}
+
 // DTW over onset TIMES (not frames): robust, tiny, and it pairs syllables
 // even when one track has an extra or missing one.
 function _pairOnsets(aT, bT) {
@@ -1483,15 +1720,23 @@ function _pairOnsets(aT, bT) {
 function buildSyllableChain(videoPath, ttsPath, label, jobId) {
   let pairs;
   try {
-    const envV = _envelope(_pcmMono(videoPath));
-    const envT = _envelope(_pcmMono(ttsPath));
-    const onV = _onsets(envV, envV.rawSd);
-    const onT = _onsets(envT, envT.rawSd);
+    // Both tracks go through the voiced detector. The clip NEEDS it — its
+    // audio is a whole scene now. The TTS does not, being clean studio
+    // audio, but it is scored identically there (1.00/1.00) and using one
+    // detector for both means any systematic bias is in both onset lists
+    // and cancels in the pairing.
+    const anV = speechAnalysis(videoPath);
+    const anT = speechAnalysis(ttsPath);
+    const onV = anV.onsets, onT = anT.onsets;
     // Guards. Each one is a case where the two tracks are not plausibly the
     // same sentence, and forcing a warp would make things worse than the
     // whole-utterance fit.
+    if (anV.reason || anT.reason) {
+      console.log(`[${jobId}] syllable-align: ${anV.reason ? 'clip: ' + anV.reason : 'voice: ' + anT.reason} — falling back`);
+      return null;
+    }
     if (onV.length < 2 || onT.length < 2) {
-      console.log(`[${jobId}] syllable-align: too few onsets (clip ${onV.length}, voice ${onT.length}) — falling back`);
+      console.log(`[${jobId}] syllable-align: too few voiced onsets (clip ${onV.length}, voice ${onT.length}) — falling back`);
       return null;
     }
     const ratio = onT.length / onV.length;
