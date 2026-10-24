@@ -677,19 +677,57 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
       : (_rawADur ? (_rawADur / _rate) + _delaySec : 0);
     const _vHasAudio = !!_vInfo.hasAudio;
 
+    // ── SEEDANCE MUST NOT SPEAK, TAKE TWO (24 Oct 2026) ────────────────────
+    // generate's audio_prompt ("no speech, no dialogue...") is a request to
+    // the model, not an enforced constraint, and it is not reliably obeyed —
+    // Elite heard Seedance's own voice on finished videos, separate from (and
+    // competing with) the TTS. He was specific: the ambience and effects
+    // (birds, bees, footsteps, etc.) must stay — only the voice has to go.
+    //
+    // The sidechain duck below only lowers [0:a] WHILE the TTS is talking. It
+    // does nothing in the gaps between lines, before the voiceover starts, or
+    // after it ends — exactly where a model-rendered line plays at full
+    // AMBIENCE_LEVEL with nothing to mask it.
+    //
+    // Fix: find where Seedance's OWN track is actually VOICED — periodic,
+    // 70-350Hz, the same test _analyseSpeech() uses for alignment (1.00
+    // precision/recall on the measured set, because it tells a syllable from
+    // a smash or a footstep by periodicity, not loudness) — and silence only
+    // those windows. Effects and ambience, being non-periodic, pass through
+    // untouched. This is independent of what the TTS is doing, so it also
+    // catches Seedance speaking in a gap or after the voiceover has finished.
+    //
+    // MUTE_SEEDANCE_VOICE=0 turns this off without a redeploy if it ever
+    // needs to come back out in a hurry.
+    let _seedanceMuteFilter = '';
+    if (_vHasAudio && _vDur > 0 && process.env.MUTE_SEEDANCE_VOICE !== '0') {
+      try {
+        const _segs = _speechSegments(_pcmMono(vPath));
+        if (_segs.length) {
+          console.log(`[${job_id}] voice-merge: muting Seedance's own voice in ` +
+            `${_segs.length} window(s): ` +
+            _segs.map(s => `${s.start.toFixed(2)}-${s.end.toFixed(2)}s`).join(', '));
+          _seedanceMuteFilter = _segs.map(s =>
+            `volume=enable='between(mod(t,${_vDur.toFixed(3)}),${s.start.toFixed(3)},${s.end.toFixed(3)})':volume=0.03,`
+          ).join('');
+        }
+      } catch (e) {
+        console.warn(`[${job_id}] voice-merge: Seedance speech-segment detection ` +
+          `failed (${e.message}) — leaving its track untouched`);
+      }
+    }
+
     // Builds the audio half of the filter graph. [1:a] is the TTS; [0:a],
-    // when it exists, is Seedance's ambience.
+    // when it exists, is Seedance's ambience (with its own voice, if any was
+    // detected above, pre-muted by _seedanceMuteFilter before anything else
+    // happens to the track).
     //   • asplit is required because the voice is used TWICE — once as the
     //     sidechain trigger that pushes the ambience down, once in the mix
     //     itself. ffmpeg auto-splits raw input pads but NOT filter outputs,
     //     so without this the graph fails to build.
     //   • duration=longest + an explicit -t keeps the delayed tail intact.
-    // Seedance's track now carries its own rendition of the SAME line the
-    // voiceover speaks (the frontend hands it the script so the lips match),
-    // so it is set lower than a pure-ambience mix would need — low enough
-    // that its version reads as room presence rather than an echo, while
-    // wind, rain and traffic still come through. AMBIENCE_LEVEL overrides it
-    // without a code change if it wants taste-tuning.
+    // AMBIENCE_LEVEL sets how loud Seedance's own track (effects, room tone)
+    // sits under the voiceover. Tune without a code change via the env var.
     const _envAmb = parseFloat(process.env.AMBIENCE_LEVEL);
     const AMBIENCE_LEVEL = Number.isFinite(_envAmb)
       ? Math.min(Math.max(_envAmb, 0), 1)
@@ -760,7 +798,7 @@ app.post('/voice-merge', requireAuth, async (req, res) => {
       return {
         filter:
           `${pre}${delayed},asplit=2[vA][vB];` +
-          `[0:a]volume=${AMBIENCE_LEVEL}[amb];` +
+          `[0:a]${_seedanceMuteFilter}volume=${AMBIENCE_LEVEL}[amb];` +
           `[vA]apad[vkey];` +
           `[amb][vkey]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300[duck];` +
           `[vB][duck]amix=inputs=2:duration=longest:dropout_transition=0${FIXPTS}[aout]`,
@@ -1738,6 +1776,66 @@ function _analyseSpeech(sig) {
       : null,
     reason: null
   };
+}
+
+// ═══ SPEECH-ONLY SEGMENTS, for muting Seedance's own voice (24 Oct 2026) ══
+// _analyseSpeech() above collapses everything between the first and last
+// voiced frame into one span — right for "where does the mouth move", wrong
+// for "which exact moments is Seedance actually voicing". An effect sitting
+// between two voiced bursts (a smash between two words of a sentence it
+// shouldn't be saying) would get silenced too if the whole span were muted.
+//
+// This returns each voiced run separately, using the identical voicing +
+// speech-band-energy test as _analyseSpeech (same constants, same measured
+// 1.00 precision/recall telling a syllable from a scene event) — then:
+//   • gap-merges runs closer than SPEECH_SEG_GAP, so a sentence's own
+//     word-to-word pauses don't chatter the mute on and off;
+//   • pads each run's edges by SPEECH_SEG_PAD, so an onset or offset isn't
+//     clipped mid-syllable;
+//   • drops anything left shorter than SPEECH_SEG_MIN after merging, as
+//     more likely a stray false-positive frame than a real word.
+const SPEECH_SEG_GAP = 0.22;   // seconds; merge runs closer than this
+const SPEECH_SEG_PAD = 0.08;   // seconds; pad each run's edges
+const SPEECH_SEG_MIN = 0.05;   // seconds; discard runs shorter than this
+
+function _speechSegments(sig) {
+  const b = _speechBand(sig);
+  const e = _frameEnergy(b);
+  const n = e.length;
+  if (n < 5) return [];
+
+  const srt = Array.from(e).sort((x, y) => x - y);
+  const floor = srt[Math.floor(n * 0.2)], ceil = srt[Math.floor(n * 0.9)];
+  const range = ceil - floor;
+  if (range < SYL_MIN_RANGE) return [];   // speech band is static — no voice in it
+
+  const eMin = floor + SYL_ENERGY_FRAC * range;
+  const vo = _voicing(b, e, eMin);
+
+  const runs = [];
+  let start = -1;
+  for (let i = 0; i < n; i++) {
+    const speaking = vo[i] > SYL_VOICE_MIN && e[i] > eMin;
+    if (speaking && start < 0) start = i;
+    else if (!speaking && start >= 0) { runs.push([start, i]); start = -1; }
+  }
+  if (start >= 0) runs.push([start, n]);
+  if (!runs.length) return [];
+
+  const merged = [runs[0]];
+  for (let i = 1; i < runs.length; i++) {
+    const prev = merged[merged.length - 1], cur = runs[i];
+    const gapSec = (cur[0] - prev[1]) * SYL_HOP / SYL_SR;
+    if (gapSec < SPEECH_SEG_GAP) prev[1] = cur[1];
+    else merged.push(cur);
+  }
+
+  return merged
+    .map(([a, z]) => ({
+      start: Math.max(0, a * SYL_HOP / SYL_SR - SPEECH_SEG_PAD),
+      end: z * SYL_HOP / SYL_SR + SPEECH_SEG_PAD
+    }))
+    .filter(s => s.end - s.start >= SPEECH_SEG_MIN);
 }
 
 // Decoding a clip costs 175-324ms of blocked event loop, and the window fit
