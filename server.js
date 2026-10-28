@@ -1430,7 +1430,21 @@ async function mergeVideosSmooth(files, outputFile) {
   for (const f of files) probes.push(await probeClip(f));
   const durs = probes.map((p) => p.duration);
   if (durs.some((d) => !d || d <= T + 0.2)) throw new Error('clip durations unusable for crossfade');
-  const allAudio = probes.every((p) => p.hasAudio);
+
+  // ── ONE SILENT CLIP NO LONGER KILLS EVERYONE'S AMBIENCE (28 Oct 2026) ──
+  // This used to be `allAudio = probes.every(p => p.hasAudio)`: if even ONE
+  // of N seamless clips came back from Seedance with no audio track (API
+  // flake, timeout, whatever), the WHOLE merged video lost audio — every
+  // OTHER clip's wind, rain, footsteps thrown away too, not just the one
+  // that actually had none. Elite's instruction: ambience must never be
+  // killed. One bad clip in four was enough to do exactly that.
+  //
+  // Fix: any clip missing audio gets a SILENT placeholder track of its own
+  // duration (ffmpeg's anullsrc, as an extra lavfi input appended after the
+  // real files). The acrossfade chain then runs across every clip
+  // uniformly — real ambience where Seedance provided it, silence only for
+  // the one clip that didn't, never for the clips that did.
+  const anyAudio = probes.some((p) => p.hasAudio);
 
   // Video: chain xfade transitions. offset = running merged length - T.
   const filters = [];
@@ -1444,23 +1458,39 @@ async function mergeVideosSmooth(files, outputFile) {
     prevV = out;
   }
 
-  // Audio: acrossfade chain, only if every clip actually has audio
   const maps = ['vout'];
-  if (allAudio) {
-    let prevA = '0:a';
+  const cmd = ffmpeg();
+  files.forEach((f) => cmd.input(f));
+
+  if (anyAudio) {
+    // audioRef[i] = the ffmpeg input index to read this clip's audio from —
+    // the real file (i) when it has audio, otherwise a new silent lavfi
+    // input appended after all the real files.
+    const audioRef = [];
+    let nextInput = files.length;
+    for (let i = 0; i < files.length; i++) {
+      if (probes[i].hasAudio) {
+        audioRef.push(i);
+      } else {
+        cmd.input('anullsrc=channel_layout=stereo:sample_rate=48000')
+          .inputOptions(['-f', 'lavfi', '-t', durs[i].toFixed(3)]);
+        audioRef.push(nextInput);
+        nextInput++;
+      }
+    }
+
+    let prevA = `${audioRef[0]}:a`;
     for (let i = 1; i < files.length; i++) {
       const outA = (i === files.length - 1) ? 'aout' : ('a' + i);
-      filters.push(`[${prevA}][${i}:a]acrossfade=d=${T}[${outA}]`);
+      filters.push(`[${prevA}][${audioRef[i]}:a]acrossfade=d=${T}[${outA}]`);
       prevA = outA;
     }
     maps.push('aout');
   }
 
   await new Promise((resolve, reject) => {
-    const cmd = ffmpeg();
-    files.forEach((f) => cmd.input(f));
     const outOpts = ['-c:v libx264', '-pix_fmt yuv420p', '-preset veryfast', '-crf 20', '-movflags +faststart'];
-    if (allAudio) { outOpts.push('-c:a aac', '-b:a 128k'); } else { outOpts.push('-an'); }
+    if (anyAudio) { outOpts.push('-c:a aac', '-b:a 128k'); } else { outOpts.push('-an'); }
     cmd.complexFilter(filters, maps)
       .outputOptions(outOpts)
       .output(outputFile)
